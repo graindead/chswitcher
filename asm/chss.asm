@@ -33,6 +33,7 @@ IMP CloseHandle
 IMP GetFileTime
 IMP GetFileAttributesA
 IMP CreateDirectoryA
+IMP DeleteFileA
 IMP GetEnvironmentVariableA
 IMP GetPrivateProfileStringA
 IMP WritePrivateProfileStringA
@@ -81,15 +82,17 @@ IMP WinHttpWebSocketQueryCloseStatus
 IMP WinHttpCloseHandle
 IMP BCryptHash
 IMP CryptBinaryToStringA
+IMP CryptStringToBinaryA
+IMP CryptProtectData
+IMP CryptUnprotectData
+IMP LocalFree
 
 CS_ENTER macro
-    lea rcx, g_cs
-    call [__imp_EnterCriticalSection]
+    call cs_enter
 endm
 
 CS_LEAVE macro
-    lea rcx, g_cs
-    call [__imp_LeaveCriticalSection]
+    call cs_leave
 endm
 
 RBUF_SIZE   equ 262144
@@ -133,6 +136,7 @@ k_file      db 'song_file',0
 k_mpsong    db 'mp_song_scene',0
 k_mpmenu    db 'mp_menu_scene',0
 k_mode      db 'mode',0
+k_passenc   db 'password_enc',0
 d_host      db 'localhost',0
 d_port      db '4455',0
 d_delay     db '0',0
@@ -211,6 +215,8 @@ ev_missing    db "A saved scene isn't in OBS anymore - pick it again.",0
 
 align 8
 ; key, buffer, buffer size, default
+; The plain "password" key is only read, to import it from older versions;
+; save_settings writes it encrypted as password_enc instead.
 settings_tbl dq k_host,  g_host,  256,  d_host
              dq k_port,  g_port,  16,   d_port
              dq k_pass,  g_pass,  256,  s_empty
@@ -245,6 +251,8 @@ g_ofn       dq 19 dup(?)    ; OPENFILENAMEA (152 bytes)
 g_nid       dq 66 dup(?)    ; NOTIFYICONDATAA (528 bytes)
 g_tci       dq 5 dup(?)     ; TCITEMA (40 bytes)
 g_pt        dq ?
+g_blobin    dq 2 dup(?)     ; DATA_BLOB
+g_blobout   dq 2 dup(?)
 g_mode      dd ?            ; selected tab: 0 = singleplayer, 1 = multiplayer
 g_modechg   dd ?            ; set by the UI when the tab changes
 g_want      dd ?
@@ -252,7 +260,8 @@ g_reconnect dd ?
 g_read      dd ?
 g_rlen      dd ?
 g_rtype     dd ?
-g_cch       dd ?
+g_cch       dd ?            ; worker thread
+g_cchui     dd ?            ; UI thread
 g_reasonlen dd ?
 g_nscenes   dd ?
 g_closecode dw ?
@@ -308,6 +317,18 @@ g_pool      db MAXSCENES*512 dup(?)
 
 ; ---------------------------------------------------------------------------
 .code
+
+; ---- g_cs lock (shared so each use is a 5-byte call) ------------------------
+
+cs_enter PROC
+    lea rcx, g_cs
+    jmp [__imp_EnterCriticalSection]
+cs_enter ENDP
+
+cs_leave PROC
+    lea rcx, g_cs
+    jmp [__imp_LeaveCriticalSection]
+cs_leave ENDP
 
 ; ---- string helpers (leaf) -------------------------------------------------
 
@@ -831,9 +852,13 @@ save_settings PROC
     lea rcx, g_dir
     xor edx, edx
     call [__imp_CreateDirectoryA]
+    call save_pass
     lea rbx, settings_tbl
     mov esi, NSET
 sv_l:
+    lea rax, g_pass                 ; never written in plain text
+    cmp [rbx+8], rax
+    je sv_next
     ; quote the value so leading/trailing spaces and quotes survive
     lea rcx, g_uitmp2
     mov byte ptr [rcx], 22h
@@ -846,6 +871,7 @@ sv_l:
     lea r8, g_uitmp2
     lea r9, g_ini
     call [__imp_WritePrivateProfileStringA]
+sv_next:
     add rbx, 32
     dec esi
     jnz sv_l
@@ -854,6 +880,121 @@ sv_l:
     pop rbx
     ret
 save_settings ENDP
+
+; Writes g_pass encrypted with DPAPI (only this Windows user can decrypt it) as
+; base64 in password_enc, and removes any plain-text password left by older versions.
+save_pass PROC
+    sub rsp, 48h
+    mov byte ptr g_uitmp2, 0
+    lea rcx, g_pass
+    call strlen
+    test eax, eax
+    jz sp_write                     ; no password: store nothing
+    mov dword ptr g_blobin, eax
+    lea rax, g_pass
+    mov qword ptr g_blobin+8, rax
+    lea rcx, g_blobin
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
+    and qword ptr [rsp+20h], 0
+    mov qword ptr [rsp+28h], 1      ; CRYPTPROTECT_UI_FORBIDDEN
+    lea rax, g_blobout
+    mov [rsp+30h], rax
+    call [__imp_CryptProtectData]
+    test eax, eax
+    jz sp_write
+    mov g_cchui, 2048
+    lea rax, g_cchui
+    mov [rsp+20h], rax
+    mov rcx, qword ptr g_blobout+8
+    mov edx, dword ptr g_blobout
+    mov r8d, 40000001h              ; CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF
+    lea r9, g_uitmp2
+    call [__imp_CryptBinaryToStringA]
+    mov rcx, qword ptr g_blobout+8
+    call [__imp_LocalFree]
+sp_write:
+    lea rcx, s_section
+    lea rdx, k_passenc
+    lea r8, g_uitmp2
+    lea r9, g_ini
+    call [__imp_WritePrivateProfileStringA]
+    lea rcx, s_section
+    lea rdx, k_pass
+    xor r8d, r8d                    ; NULL deletes the key
+    lea r9, g_ini
+    call [__imp_WritePrivateProfileStringA]
+    add rsp, 48h
+    ret
+save_pass ENDP
+
+; Reads password_enc into g_pass -> eax = 1 if there was one to decrypt
+load_pass PROC
+    sub rsp, 48h
+    lea rcx, s_section
+    lea rdx, k_passenc
+    lea r8, s_empty
+    lea r9, g_uitmp2
+    mov qword ptr [rsp+20h], 2048
+    lea rax, g_ini
+    mov [rsp+28h], rax
+    call [__imp_GetPrivateProfileStringA]
+    test eax, eax
+    jz lp_ret
+    mov g_cchui, 1024
+    lea rcx, g_uitmp2
+    xor edx, edx                    ; zero-terminated
+    mov r8d, 1                      ; CRYPT_STRING_BASE64
+    lea r9, g_uitmp
+    lea rax, g_cchui
+    mov [rsp+20h], rax
+    and qword ptr [rsp+28h], 0
+    and qword ptr [rsp+30h], 0
+    call [__imp_CryptStringToBinaryA]
+    test eax, eax
+    jz lp_done
+    mov eax, g_cchui
+    mov dword ptr g_blobin, eax
+    lea rax, g_uitmp
+    mov qword ptr g_blobin+8, rax
+    lea rcx, g_blobin
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
+    and qword ptr [rsp+20h], 0
+    mov qword ptr [rsp+28h], 1      ; CRYPTPROTECT_UI_FORBIDDEN
+    lea rax, g_blobout
+    mov [rsp+30h], rax
+    call [__imp_CryptUnprotectData]
+    test eax, eax
+    jz lp_done                      ; e.g. another Windows user: password must be re-entered
+    mov ecx, dword ptr g_blobout
+    cmp ecx, 255
+    jbe lp_len
+    mov ecx, 255
+lp_len:
+    mov rdx, qword ptr g_blobout+8
+    lea r8, g_pass
+lp_cpy:
+    test ecx, ecx
+    jz lp_end
+    mov al, [rdx]
+    mov [r8], al
+    inc rdx
+    inc r8
+    dec ecx
+    jmp lp_cpy
+lp_end:
+    mov byte ptr [r8], 0
+    mov rcx, qword ptr g_blobout+8
+    call [__imp_LocalFree]
+lp_done:
+    mov eax, 1
+lp_ret:
+    add rsp, 48h
+    ret
+load_pass ENDP
 
 ; Import settings.json from the Python version if there is no settings.ini yet
 migrate PROC
@@ -1842,11 +1983,9 @@ worker ENDP
 
 ; ---- UI thread -------------------------------------------------------------------
 
-; ecx = control id, rdx = UTF-8 text
-set_text_u8 PROC
-    push rbx
-    sub rsp, 30h
-    mov ebx, ecx
+; rdx = UTF-8 text -> g_wtmp (UTF-16)
+u8_to_wtmp PROC
+    sub rsp, 38h
     mov r8, rdx
     mov ecx, 65001
     xor edx, edx
@@ -1855,11 +1994,21 @@ set_text_u8 PROC
     mov [rsp+20h], rax
     mov qword ptr [rsp+28h], 1024
     call [__imp_MultiByteToWideChar]
+    add rsp, 38h
+    ret
+u8_to_wtmp ENDP
+
+; ecx = control id, rdx = UTF-8 text
+set_text_u8 PROC
+    push rbx
+    sub rsp, 20h
+    mov ebx, ecx
+    call u8_to_wtmp
     mov rcx, g_hDlg
     mov edx, ebx
     lea r8, g_wtmp
     call [__imp_SetDlgItemTextW]
-    add rsp, 30h
+    add rsp, 20h
     pop rbx
     ret
 set_text_u8 ENDP
@@ -1894,6 +2043,12 @@ get_text_u8 PROC
     ret
 get_text_u8 ENDP
 
+; ecx = control id, edx = message, with wParam = lParam = 0 -> rax = result
+send_dlg0 PROC
+    xor r8d, r8d
+    xor r9d, r9d
+send_dlg0 ENDP                      ; falls through into send_dlg
+
 ; ecx = control id, edx = message, r8 = wParam, r9 = lParam -> rax = result
 send_dlg PROC
     sub rsp, 38h
@@ -1910,22 +2065,15 @@ send_dlg ENDP
 ; ecx = combo id, rdx = UTF-8 item text
 combo_add PROC
     push rbx
-    sub rsp, 30h
+    sub rsp, 20h
     mov ebx, ecx
-    mov r8, rdx
-    mov ecx, 65001
-    xor edx, edx
-    mov r9d, -1
-    lea rax, g_wtmp
-    mov [rsp+20h], rax
-    mov qword ptr [rsp+28h], 1024
-    call [__imp_MultiByteToWideChar]
+    call u8_to_wtmp
     mov ecx, ebx
     mov edx, 143h                   ; CB_ADDSTRING
     xor r8d, r8d
     lea r9, g_wtmp
     call send_dlg
-    add rsp, 30h
+    add rsp, 20h
     pop rbx
     ret
 combo_add ENDP
@@ -2054,14 +2202,10 @@ fill_scenes PROC
     CS_ENTER
     mov ecx, IDC_SONG
     mov edx, 14Bh                   ; CB_RESETCONTENT
-    xor r8d, r8d
-    xor r9d, r9d
-    call send_dlg
+    call send_dlg0
     mov ecx, IDC_MENU
     mov edx, 14Bh
-    xor r8d, r8d
-    xor r9d, r9d
-    call send_dlg
+    call send_dlg0
     mov ecx, IDC_MENU
     lea rdx, s_noneitem
     call combo_add
@@ -2277,9 +2421,7 @@ dc_song:
     jne dp_true
     mov ecx, IDC_SONG
     mov edx, 147h                   ; CB_GETCURSEL
-    xor r8d, r8d
-    xor r9d, r9d
-    call send_dlg
+    call send_dlg0
     mov r12d, eax
     CS_ENTER
     cmp r12d, g_nscenes
@@ -2299,9 +2441,7 @@ dc_menu:
     jne dp_true
     mov ecx, IDC_MENU
     mov edx, 147h
-    xor r8d, r8d
-    xor r9d, r9d
-    call send_dlg
+    call send_dlg0
     mov r12d, eax
     CS_ENTER
     call active_bufs
@@ -2429,9 +2569,7 @@ dp_notify:
     jne dp_false
     mov ecx, IDC_TAB
     mov edx, 130Bh                  ; TCM_GETCURSEL
-    xor r8d, r8d
-    xor r9d, r9d
-    call send_dlg
+    call send_dlg0
     mov r12d, eax
     CS_ENTER
     mov g_mode, r12d
@@ -2504,7 +2642,16 @@ main PROC
     call init_paths
     call load_settings
     call migrate
+    lea rcx, g_json                 ; the old settings.json holds a plain-text password
+    call [__imp_DeleteFileA]
     call load_settings
+    call load_pass
+    test eax, eax
+    jnz mn_enc
+    cmp byte ptr g_pass, 0          ; plain-text password from an older version:
+    je mn_enc                       ; save it encrypted, which also removes it
+    call save_settings
+mn_enc:
     call find_song_file
     xor eax, eax
     cmp byte ptr g_modestr, '1'
