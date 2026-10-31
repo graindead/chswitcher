@@ -1,5 +1,7 @@
 # CH Scene Switcher
 
+THIS IS AI GENERATED SLUDGE
+
 Switches OBS scenes automatically while you play [Clone Hero](https://clonehero.net/):
 one scene while a song is playing, another in the menus.
 
