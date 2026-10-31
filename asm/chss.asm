@@ -66,6 +66,7 @@ IMP GetCursorPos
 IMP Shell_NotifyIconA
 IMP GetOpenFileNameA
 IMP InitCommonControls
+IMP EnableThemeDialogTexture
 IMP WinHttpOpen
 IMP WinHttpSetTimeouts
 IMP WinHttpConnect
@@ -94,7 +95,7 @@ endm
 RBUF_SIZE   equ 262144
 TEXTSIZE    equ 4096
 MAXSCENES   equ 256
-NSET        equ 7
+NSET        equ 10
 POLL_MS     equ 250
 RETRY_MS    equ 5000
 
@@ -110,6 +111,7 @@ IDC_FILE    equ 108
 IDC_BROWSE  equ 109
 IDC_CONN    equ 110
 IDC_EVENT   equ 111
+IDC_TAB     equ 112
 ID_SHOW     equ 200
 ID_EXIT     equ 201
 
@@ -128,6 +130,9 @@ k_song      db 'song_scene',0
 k_menu      db 'menu_scene',0
 k_delay     db 'menu_delay',0
 k_file      db 'song_file',0
+k_mpsong    db 'mp_song_scene',0
+k_mpmenu    db 'mp_menu_scene',0
+k_mode      db 'mode',0
 d_host      db 'localhost',0
 d_port      db '4455',0
 d_delay     db '0',0
@@ -183,6 +188,8 @@ s_title     db 'CH Scene Switcher',0
 s_show      db 'Show',0
 s_exit      db 'Exit',0
 s_noneitem  db '(none)',0
+s_sp        db 'Singleplayer',0
+s_mp        db 'Multiplayer',0
 s_filter    db 'Text files',0,'*.txt',0,'All files',0,'*.*',0,0
 
 st_enter      db 'Enter your OBS WebSocket details and click Connect.',0
@@ -211,6 +218,9 @@ settings_tbl dq k_host,  g_host,  256,  d_host
              dq k_menu,  g_menu,  512,  s_empty
              dq k_delay, g_delay, 32,   d_delay
              dq k_file,  g_file,  1024, s_empty
+             dq k_mpsong, g_mpsong, 512, s_empty
+             dq k_mpmenu, g_mpmenu, 512, s_empty
+             dq k_mode,  g_modestr, 4,  d_delay      ; "0" = singleplayer, "1" = multiplayer
 ; settings.json patterns, in settings_tbl order (ending in " = string value, else number)
 mig_tbl      dq m_host, m_port, m_pass, m_song, m_menu, m_delay, m_file, 0
 sfx_tbl      dq sfx1, sfx2, sfx3, 0
@@ -233,7 +243,10 @@ g_scenes    dq MAXSCENES dup(?)
 g_tmpptrs   dq MAXSCENES dup(?)
 g_ofn       dq 19 dup(?)    ; OPENFILENAMEA (152 bytes)
 g_nid       dq 66 dup(?)    ; NOTIFYICONDATAA (528 bytes)
+g_tci       dq 5 dup(?)     ; TCITEMA (40 bytes)
 g_pt        dq ?
+g_mode      dd ?            ; selected tab: 0 = singleplayer, 1 = multiplayer
+g_modechg   dd ?            ; set by the UI when the tab changes
 g_want      dd ?
 g_reconnect dd ?
 g_read      dd ?
@@ -254,6 +267,9 @@ g_song      db 512 dup(?)
 g_menu      db 512 dup(?)
 g_delay     db 32 dup(?)
 g_file      db 1024 dup(?)
+g_mpsong    db 512 dup(?)   ; multiplayer scenes (g_song/g_menu are singleplayer)
+g_mpmenu    db 512 dup(?)
+g_modestr   db 4 dup(?)
 ; worker's copies
 c_host      db 256 dup(?)
 c_port      db 16 dup(?)
@@ -1483,15 +1499,32 @@ post_connected PROC
     ret
 post_connected ENDP
 
+; -> rax = song scene buffer, rdx = menu scene buffer for the selected tab
+active_bufs PROC
+    lea rax, g_song
+    lea rdx, g_menu
+    cmp g_mode, 0
+    je ab_ret
+    lea rax, g_mpsong
+    lea rdx, g_mpmenu
+ab_ret:
+    ret
+active_bufs ENDP
+
 ; Copy the settings the watcher needs
 wk_sync PROC
+    push rbx
+    push rsi
     sub rsp, 28h
     CS_ENTER
+    call active_bufs
+    mov rbx, rax
+    mov rsi, rdx
     lea rcx, w_song
-    lea rdx, g_song
+    mov rdx, rbx
     call stpcpy
     lea rcx, w_menu
-    lea rdx, g_menu
+    mov rdx, rsi
     call stpcpy
     lea rcx, w_file
     lea rdx, g_file
@@ -1500,6 +1533,8 @@ wk_sync PROC
     mov w_delayms, rax
     CS_LEAVE
     add rsp, 28h
+    pop rsi
+    pop rbx
     ret
 wk_sync ENDP
 
@@ -1662,6 +1697,35 @@ wk_loop:
     xor ebx, ebx
     xor esi, esi
 wk_noreq:
+    ; tab changed: move OBS to the new tab's scene for where we are now
+    xor eax, eax
+    xchg eax, g_modechg
+    test eax, eax
+    jz wk_nomode
+    test ebx, ebx
+    jz wk_nomode
+    call wk_sync
+    lea rcx, w_msg
+    lea rdx, s_sp
+    cmp g_mode, 0
+    je wk_mname
+    lea rdx, s_mp
+wk_mname:
+    call stpcpy
+    mov rdx, rax
+    lea rcx, w_song
+    test r13d, r13d
+    jnz wk_mswitch
+    test r14d, r14d                 ; menu switch still pending: it uses the new scene
+    jnz wk_nomode
+    lea rcx, w_menu
+wk_mswitch:
+    call wk_switch
+    test eax, eax
+    jnz wk_nomode
+    xor ebx, ebx
+    xor esi, esi
+wk_nomode:
     test ebx, ebx
     jnz wk_watch
     cmp g_want, 0
@@ -1919,6 +1983,68 @@ tray_icon PROC
     ret
 tray_icon ENDP
 
+; rcx = scene buffer: empty it if that scene isn't in OBS -> eax = 1 if emptied
+; (call with g_cs held)
+drop_missing PROC
+    push rbx
+    sub rsp, 20h
+    mov rbx, rcx
+    call scene_index
+    cmp eax, -1
+    jne dm_keep
+    cmp byte ptr [rbx], 0
+    je dm_keep
+    mov byte ptr [rbx], 0
+    mov eax, 1
+    jmp dm_ret
+dm_keep:
+    xor eax, eax
+dm_ret:
+    add rsp, 20h
+    pop rbx
+    ret
+drop_missing ENDP
+
+; Select the selected tab's scenes in the dropdowns (call with g_cs held)
+select_scenes PROC
+    push rbx
+    sub rsp, 20h
+    call active_bufs
+    mov rbx, rdx
+    mov rcx, rax
+    call scene_index
+    movsxd r8, eax                  ; -1 clears the selection
+    mov ecx, IDC_SONG
+    mov edx, 14Eh                   ; CB_SETCURSEL
+    xor r9d, r9d
+    call send_dlg
+    mov rcx, rbx
+    call scene_index
+    inc eax                         ; "(none)" is item 0; missing -> 0 too
+    mov r8d, eax
+    mov ecx, IDC_MENU
+    mov edx, 14Eh
+    xor r9d, r9d
+    call send_dlg
+    add rsp, 20h
+    pop rbx
+    ret
+select_scenes ENDP
+
+; rcx = tab text, edx = position
+tab_add PROC
+    sub rsp, 28h
+    mov dword ptr g_tci, 1          ; TCIF_TEXT
+    mov qword ptr g_tci+16, rcx
+    mov r8d, edx
+    mov ecx, IDC_TAB
+    mov edx, 1307h                  ; TCM_INSERTITEMA
+    lea r9, g_tci
+    call send_dlg
+    add rsp, 28h
+    ret
+tab_add ENDP
+
 ; Fill both scene dropdowns from g_scenes and select the saved scenes
 fill_scenes PROC
     push rbx
@@ -1954,36 +2080,20 @@ fc_l:
     inc ebx
     jmp fc_l
 fc_sel:
+    ; forget saved scenes that are no longer in OBS
     lea rcx, g_song
-    call scene_index
-    cmp eax, -1
-    jne fc_song
-    cmp byte ptr g_song, 0
-    je fc_menu
-    mov byte ptr g_song, 0
-    mov esi, 1
-    jmp fc_menu
-fc_song:
-    mov r8d, eax
-    mov ecx, IDC_SONG
-    mov edx, 14Eh                   ; CB_SETCURSEL
-    xor r9d, r9d
-    call send_dlg
-fc_menu:
+    call drop_missing
+    or esi, eax
     lea rcx, g_menu
-    call scene_index
-    inc eax                         ; "(none)" is item 0; missing -> 0 too
-    jnz fc_msel
-    cmp byte ptr g_menu, 0
-    je fc_msel
-    mov byte ptr g_menu, 0
-    mov esi, 1
-fc_msel:
-    mov r8d, eax
-    mov ecx, IDC_MENU
-    mov edx, 14Eh
-    xor r9d, r9d
-    call send_dlg
+    call drop_missing
+    or esi, eax
+    lea rcx, g_mpsong
+    call drop_missing
+    or esi, eax
+    lea rcx, g_mpmenu
+    call drop_missing
+    or esi, eax
+    call select_scenes
     CS_LEAVE
     test esi, esi
     jz fc_ret
@@ -2021,6 +2131,8 @@ DlgProc PROC
     je dp_scenes
     cmp edx, WM_APP_TRAY
     je dp_tray
+    cmp edx, 4Eh                    ; WM_NOTIFY
+    je dp_notify
 dp_false:
     xor eax, eax
     jmp dp_ret
@@ -2053,6 +2165,21 @@ dp_init:
     mov edx, IDC_FILE
     lea r8, g_file
     call [__imp_SetDlgItemTextA]
+    ; Singleplayer / Multiplayer tabs, drawn so the labels blend with the tab
+    mov rcx, rbx
+    mov edx, 6                      ; ETDT_ENABLETAB
+    call [__imp_EnableThemeDialogTexture]
+    lea rcx, s_sp
+    xor edx, edx
+    call tab_add
+    lea rcx, s_mp
+    mov edx, 1
+    call tab_add
+    mov ecx, IDC_TAB
+    mov edx, 130Ch                  ; TCM_SETCURSEL
+    mov r8d, g_mode
+    xor r9d, r9d
+    call send_dlg
     ; tray icon
     mov dword ptr g_nid, 528
     mov qword ptr g_nid+8, rbx
@@ -2080,7 +2207,10 @@ dp_init:
     call [__imp_CloseHandle]
     ; saved settings: connect straight away
     cmp byte ptr g_song, 0
+    jne di_auto
+    cmp byte ptr g_mpsong, 0
     je di_new
+di_auto:
     call request_connect
     jmp dp_true
 di_new:
@@ -2154,9 +2284,10 @@ dc_song:
     CS_ENTER
     cmp r12d, g_nscenes
     jae dc_unlock
+    call active_bufs
+    mov rcx, rax
     lea rax, g_scenes
     mov rdx, [rax+r12*8]
-    lea rcx, g_song
     call stpcpy
     mov ecx, IDC_EVENT              ; drop the "pick a scene" hint
     lea rdx, s_empty
@@ -2173,7 +2304,9 @@ dc_menu:
     call send_dlg
     mov r12d, eax
     CS_ENTER
-    mov byte ptr g_menu, 0
+    call active_bufs
+    mov rdi, rdx
+    mov byte ptr [rdi], 0
     test r12d, r12d                 ; item 0 = "(none)"
     jz dc_unlock
     dec r12d
@@ -2181,7 +2314,7 @@ dc_menu:
     jae dc_unlock
     lea rax, g_scenes
     mov rdx, [rax+r12*8]
-    lea rcx, g_menu
+    mov rcx, rdi
     call stpcpy
 dc_unlock:
     CS_LEAVE
@@ -2289,6 +2422,30 @@ dp_scenes:
     call fill_scenes
     jmp dp_true
 
+dp_notify:
+    cmp qword ptr [rdi+8], IDC_TAB  ; NMHDR.idFrom
+    jne dp_false
+    cmp dword ptr [rdi+16], -551    ; TCN_SELCHANGE
+    jne dp_false
+    mov ecx, IDC_TAB
+    mov edx, 130Bh                  ; TCM_GETCURSEL
+    xor r8d, r8d
+    xor r9d, r9d
+    call send_dlg
+    mov r12d, eax
+    CS_ENTER
+    mov g_mode, r12d
+    lea eax, [r12+'0']
+    mov byte ptr g_modestr, al
+    mov byte ptr g_modestr+1, 0
+    call select_scenes
+    CS_LEAVE
+    call save_settings
+    mov g_modechg, 1
+    mov rcx, g_hEvent
+    call [__imp_SetEvent]
+    jmp dp_true
+
 dp_tray:
     cmp edi, 202h                   ; WM_LBUTTONUP
     je dt_show
@@ -2349,6 +2506,10 @@ main PROC
     call migrate
     call load_settings
     call find_song_file
+    xor eax, eax
+    cmp byte ptr g_modestr, '1'
+    sete al
+    mov g_mode, eax
     lea rcx, g_delay
     call parse_ms
     cmp rax, -1

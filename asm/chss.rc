@@ -12,8 +12,9 @@
 #define IDC_BROWSE  109
 #define IDC_CONN    110
 #define IDC_EVENT   111
+#define IDC_TAB     112
 
-1 DIALOGEX 0, 0, 250, 172
+1 DIALOGEX 0, 0, 250, 180
 STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 CAPTION "CH Scene Switcher"
 FONT 9, "Segoe UI"
@@ -27,26 +28,30 @@ BEGIN
     EDITTEXT        IDC_PASS, 58, 33, 90, 12, ES_PASSWORD | ES_AUTOHSCROLL
     DEFPUSHBUTTON   "Connect", IDC_CONNECT, 178, 32, 58, 14
 
-    GROUPBOX        "Scenes", -1, 7, 58, 236, 64
-    LTEXT           "Song playing", -1, 14, 72, 44, 8
-    COMBOBOX        IDC_SONG, 58, 70, 178, 200, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "In menus", -1, 14, 89, 44, 8
-    COMBOBOX        IDC_MENU, 58, 87, 178, 200, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Delay (sec)", -1, 14, 106, 44, 8
-    EDITTEXT        IDC_DELAY, 58, 104, 30, 12, ES_AUTOHSCROLL
-    LTEXT           "before switching back to the menu scene", -1, 94, 106, 142, 8
+    // scenes for the selected tab (Singleplayer / Multiplayer)
+    LTEXT           "Song playing", -1, 14, 79, 44, 8
+    COMBOBOX        IDC_SONG, 58, 77, 178, 200, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "In menus", -1, 14, 96, 44, 8
+    COMBOBOX        IDC_MENU, 58, 94, 178, 200, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 
-    LTEXT           "Song file", -1, 9, 130, 46, 8
-    EDITTEXT        IDC_FILE, 58, 128, 158, 12, ES_AUTOHSCROLL
-    PUSHBUTTON      "...", IDC_BROWSE, 220, 127, 23, 14
+    // shared by both tabs
+    LTEXT           "Delay (sec)", -1, 9, 122, 46, 8
+    EDITTEXT        IDC_DELAY, 58, 120, 30, 12, ES_AUTOHSCROLL
+    LTEXT           "before switching back to the menu scene", -1, 94, 122, 149, 8
+    LTEXT           "Song file", -1, 9, 139, 46, 8
+    EDITTEXT        IDC_FILE, 58, 137, 158, 12, ES_AUTOHSCROLL
+    PUSHBUTTON      "...", IDC_BROWSE, 220, 136, 23, 14
 
-    LTEXT           "", IDC_CONN, 9, 148, 234, 9, SS_ENDELLIPSIS | SS_NOPREFIX
-    LTEXT           "", IDC_EVENT, 9, 159, 234, 9, SS_ENDELLIPSIS | SS_NOPREFIX
+    LTEXT           "", IDC_CONN, 9, 156, 234, 9, SS_ENDELLIPSIS | SS_NOPREFIX
+    LTEXT           "", IDC_EVENT, 9, 167, 234, 9, SS_ENDELLIPSIS | SS_NOPREFIX
+
+    // last, so it sits behind the scene controls it surrounds
+    CONTROL         "", IDC_TAB, "SysTabControl32", WS_TABSTOP | WS_CLIPSIBLINGS, 7, 58, 236, 56
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,1,0,0
-PRODUCTVERSION  1,1,0,0
+FILEVERSION     1,2,0,0
+PRODUCTVERSION  1,2,0,0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
@@ -55,11 +60,11 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "FileDescription",  "Switches OBS scenes when Clone Hero starts and ends songs"
-            VALUE "FileVersion",      "1.1.0.0"
+            VALUE "FileVersion",      "1.2.0.0"
             VALUE "InternalName",     "chss"
             VALUE "OriginalFilename", "CH Scene Switcher.exe"
             VALUE "ProductName",      "CH Scene Switcher"
-            VALUE "ProductVersion",   "1.1.0.0"
+            VALUE "ProductVersion",   "1.2.0.0"
         END
     END
     BLOCK "VarFileInfo"
