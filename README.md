@@ -47,8 +47,7 @@ This produces `asm\CH Scene Switcher.exe`.
 
 | Path | What |
 |---|---|
-| `asm/` | The GUI app: `chss.asm` (code), `chss.rc` (window layout and version info), `chss.manifest`, `build.bat` |
-| `asm/console/` | The earlier console version of the app, also in assembly |
+| `asm/` | The app: `chss.asm` (code), `chss.rc` (window layout and version info), `chss.manifest`, `build.bat` |
 
 ## How it works
 
