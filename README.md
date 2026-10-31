@@ -29,9 +29,7 @@ Settings are saved as you change them, in `%APPDATA%\CH Scene Switcher\settings.
 connects and starts watching by itself. Minimizing hides it to the system tray. Click the tray icon to bring it back,
 or right-click it to exit.
 
-The OBS password is never stored in plain text. It is encrypted with Windows' DPAPI, so only your Windows account
-on your PC can decrypt it. If you move `settings.ini` to another PC or user account, you'll need to enter the password
-again. A plain-text password saved by an older version is encrypted, and the plain text removed, the next time the app starts.
+The OBS password is stored in plain text in `settings.ini`, so don't share that file.
 
 ## Build
 
