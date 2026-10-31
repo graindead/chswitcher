@@ -1,0 +1,17 @@
+# build output
+*.obj
+*.res
+*.exe
+
+# settings can contain the OBS password
+settings.json
+settings.ini
+
+# the old Python version stays local
+ch_scene_switcher.py
+run.bat
+Change Settings.bat
+__pycache__/
+build/
+dist/
+*.spec
