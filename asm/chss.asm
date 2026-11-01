@@ -26,6 +26,7 @@ IMP macro n
 endm
 
 IMP ExitProcess
+IMP SetDefaultDllDirectories
 IMP GetModuleHandleA
 IMP CreateFileA
 IMP ReadFile
@@ -151,6 +152,18 @@ WM_APP_SCENES equ 8001h
 WM_APP_TRAY   equ 800Ah
 
 ; ---------------------------------------------------------------------------
+; Load configuration (IMAGE_LOAD_CONFIG_DIRECTORY64), normally supplied by the C
+; runtime. Its DependentLoadFlags make Windows load this exe's imported DLLs
+; (uxtheme, dwmapi, ...) from System32 only, never from the exe's own folder.
+CONST SEGMENT READONLY ALIGN(8) 'CONST'
+public _load_config_used
+_load_config_used label qword
+    dd 140h                         ; Size
+    db 4Ah dup(0)
+    dw 800h                         ; DependentLoadFlags = LOAD_LIBRARY_SEARCH_SYSTEM32
+    db 140h - 50h dup(0)
+CONST ENDS
+
 .data
 
 s_section   db 'settings',0
@@ -2834,6 +2847,9 @@ DlgProc ENDP
 
 main PROC
     sub rsp, 38h
+    ; DLLs loaded later (by Windows on the app's behalf) also come from System32 only
+    mov ecx, 800h                   ; LOAD_LIBRARY_SEARCH_SYSTEM32
+    call [__imp_SetDefaultDllDirectories]
     call [__imp_InitCommonControls]
     xor ecx, ecx
     call [__imp_GetModuleHandleA]
