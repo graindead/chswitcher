@@ -66,7 +66,17 @@ IMP GetCursorPos
 IMP Shell_NotifyIconA
 IMP GetOpenFileNameA
 IMP InitCommonControls
-IMP EnableThemeDialogTexture
+IMP GetDlgItem
+IMP GetDlgCtrlID
+IMP MapDialogRect
+IMP FillRect
+IMP DrawTextW
+IMP SetTextColor
+IMP SetBkMode
+IMP SetBkColor
+IMP SetWindowTheme
+IMP DwmSetWindowAttribute
+IMP CreateSolidBrush
 IMP WinHttpOpen
 IMP WinHttpSetTimeouts
 IMP WinHttpConnect
@@ -110,12 +120,33 @@ IDC_DELAY   equ 107
 IDC_FILE    equ 108
 IDC_BROWSE  equ 109
 IDC_CONN    equ 110
-IDC_EVENT   equ 111
-IDC_TAB     equ 112
+IDC_NAV     equ 112
+IDC_USEMODE equ 113
+IDC_ACTIVE  equ 114
+IDC_DOT     equ 115
+IDC_STATUS  equ 116
+IDC_DIVIDER equ 117
+IDL_HOST    equ 120             ; page labels
+IDL_PORT    equ 121
+IDL_PASS    equ 122
+IDL_SONG    equ 123
+IDL_MENU    equ 124
+IDL_FILE    equ 125
+IDL_DELAY   equ 126
 ID_SHOW     equ 200
 ID_EXIT     equ 201
 
 WM_APP_STATUS equ 8000h
+CLR_BG      equ 00202020h       ; window background (dark)
+CLR_FIELD   equ 002D2D2Dh       ; text box and dropdown background
+CLR_SELBG   equ 007C440Ch       ; selected page background
+CLR_DIVIDER equ 003C3C3Ch       ; line between the page list and the page
+CLR_TEXT    equ 00EDEDEDh       ; text in text boxes and dropdowns
+CLR_MUTED   equ 00A8A8A8h       ; labels, status, unselected pages
+CLR_ACCENT  equ 00EBB785h       ; selected page text
+CLR_DOTOFF  equ 00707070h       ; status dot: not connected
+CLR_DOTOK   equ 006EC24Ch       ;   connected
+CLR_DOTERR  equ 004B53E5h       ;   can't connect
 WM_APP_SCENES equ 8001h
 WM_APP_TRAY   equ 800Ah
 
@@ -190,6 +221,13 @@ s_exit      db 'Exit',0
 s_noneitem  db '(none)',0
 s_sp        db 'Singleplayer',0
 s_mp        db 'Multiplayer',0
+s_navconn   db 'Connection',0
+s_navfile   db 'Song file',0
+s_dot       db 0E2h, 97h, 8Fh, 0        ; U+25CF black circle
+s_notconn   db 'Not connected',0
+s_connecting db 'Connecting...',0
+s_connectd  db 'Connected',0
+s_cantconn  db "Can't connect",0
 s_filter    db 'Text files',0,'*.txt',0,'All files',0,'*.*',0,0
 
 st_enter      db 'Enter your OBS WebSocket details and click Connect.',0
@@ -224,6 +262,22 @@ settings_tbl dq k_host,  g_host,  256,  d_host
 ; settings.json patterns, in settings_tbl order (ending in " = string value, else number)
 mig_tbl      dq m_host, m_port, m_pass, m_song, m_menu, m_delay, m_file, 0
 sfx_tbl      dq sfx1, sfx2, sfx3, 0
+; brushes made in main, in g_hBgBrush order
+brush_clr    dd CLR_BG, CLR_FIELD, CLR_SELBG, CLR_DIVIDER
+; controls drawn with Windows' dark styles: 0 = DarkMode_CFD (fields), 1 = DarkMode_Explorer (buttons)
+theme_tbl    dw IDC_HOST, 0, IDC_PORT, 0, IDC_PASS, 0, IDC_FILE, 0, IDC_DELAY, 0
+             dw IDC_SONG, 0, IDC_MENU, 0, IDC_CONNECT, 1, IDC_BROWSE, 1, IDC_USEMODE, 1, 0
+w_darkcfd    dw 'D','a','r','k','M','o','d','e','_','C','F','D',0
+w_darkexp    dw 'D','a','r','k','M','o','d','e','_','E','x','p','l','o','r','e','r',0
+g_one        dd 1
+; control, pages it shows on: bit 0 Connection, 1 Singleplayer, 2 Multiplayer,
+; 3 General; 80h = "Use this mode" and 40h = "This mode is active" (see show_page)
+page_tbl     dw IDL_HOST, 1, IDC_HOST, 1, IDL_PORT, 1, IDC_PORT, 1
+             dw IDL_PASS, 1, IDC_PASS, 1, IDC_CONNECT, 1, IDC_CONN, 1
+             dw IDL_SONG, 6, IDC_SONG, 6, IDL_MENU, 6, IDC_MENU, 6
+             dw IDL_FILE, 8, IDC_FILE, 8, IDC_BROWSE, 8
+             dw IDL_DELAY, 8, IDC_DELAY, 8
+             dw IDC_USEMODE, 80h, IDC_ACTIVE, 40h, 0
 
 ; ---------------------------------------------------------------------------
 .data?
@@ -243,10 +297,18 @@ g_scenes    dq MAXSCENES dup(?)
 g_tmpptrs   dq MAXSCENES dup(?)
 g_ofn       dq 19 dup(?)    ; OPENFILENAMEA (152 bytes)
 g_nid       dq 66 dup(?)    ; NOTIFYICONDATAA (528 bytes)
-g_tci       dq 5 dup(?)     ; TCITEMA (40 bytes)
 g_pt        dq ?
-g_mode      dd ?            ; selected tab: 0 = singleplayer, 1 = multiplayer
-g_modechg   dd ?            ; set by the UI when the tab changes
+g_mode      dd ?            ; active mode: 0 = singleplayer, 1 = multiplayer
+g_view      dd ?            ; mode whose page is shown (UI thread)
+g_page      dd ?            ; 0 Connection, 1 Singleplayer, 2 Multiplayer, 3 General
+g_modechg   dd ?            ; set by the UI when the active mode changes
+g_connstate dd ?            ; 0 not connected, 1 connecting, 2 connected, 3 can't connect
+g_navpad    dd ?            ; page list text inset, in pixels
+g_rc        dd 4 dup(?)     ; RECT
+g_hBgBrush  dq ?            ; brushes, in brush_clr order
+g_hFieldBrush dq ?
+g_hSelBrush dq ?
+g_hDivBrush dq ?
 g_want      dd ?
 g_reconnect dd ?
 g_read      dd ?
@@ -1487,6 +1549,7 @@ post_status ENDP
 
 post_connected PROC
     sub rsp, 28h
+    mov g_connstate, 2
     lea rcx, w_cmsg
     lea rdx, st_connected
     call stpcpy
@@ -1510,6 +1573,18 @@ active_bufs PROC
 ab_ret:
     ret
 active_bufs ENDP
+
+; -> rax = song scene buffer, rdx = menu scene buffer for the mode page being viewed
+view_bufs PROC
+    lea rax, g_song
+    lea rdx, g_menu
+    cmp g_view, 0
+    je vb_ret
+    lea rax, g_mpsong
+    lea rdx, g_mpmenu
+vb_ret:
+    ret
+view_bufs ENDP
 
 ; Copy the settings the watcher needs
 wk_sync PROC
@@ -1575,6 +1650,7 @@ wk_connect PROC
     mov rcx, rax
     lea rdx, st_dots
     call stpcpy
+    mov g_connstate, 1
     xor ecx, ecx
     lea rdx, w_cmsg
     call post_status
@@ -1607,6 +1683,7 @@ kc_fail:
     mov rcx, rax
     lea rdx, st_retry
     call stpcpy
+    mov g_connstate, 3
     xor ecx, ecx
     lea rdx, w_cmsg
     call post_status
@@ -1632,6 +1709,7 @@ wk_switch PROC
     call sw_try
     test eax, eax
     jnz ks_ok
+    mov g_connstate, 1
     xor ecx, ecx
     lea rdx, st_lost
     call post_status
@@ -1907,12 +1985,13 @@ send_dlg PROC
     ret
 send_dlg ENDP
 
-; ecx = combo id, rdx = UTF-8 item text
-combo_add PROC
+; ecx = control id, edx = message (CB_ADDSTRING, LB_ADDSTRING), r8 = UTF-8 text
+add_string PROC
     push rbx
-    sub rsp, 30h
+    push rsi
+    sub rsp, 38h
     mov ebx, ecx
-    mov r8, rdx
+    mov esi, edx
     mov ecx, 65001
     xor edx, edx
     mov r9d, -1
@@ -1921,14 +2000,15 @@ combo_add PROC
     mov qword ptr [rsp+28h], 1024
     call [__imp_MultiByteToWideChar]
     mov ecx, ebx
-    mov edx, 143h                   ; CB_ADDSTRING
+    mov edx, esi
     xor r8d, r8d
     lea r9, g_wtmp
     call send_dlg
-    add rsp, 30h
+    add rsp, 38h
+    pop rsi
     pop rbx
     ret
-combo_add ENDP
+add_string ENDP
 
 ; rcx = name -> eax = its index in g_scenes, or -1 (call with g_cs held)
 scene_index PROC
@@ -2005,11 +2085,11 @@ dm_ret:
     ret
 drop_missing ENDP
 
-; Select the selected tab's scenes in the dropdowns (call with g_cs held)
+; Select the viewed mode's scenes in the dropdowns (call with g_cs held)
 select_scenes PROC
     push rbx
     sub rsp, 20h
-    call active_bufs
+    call view_bufs
     mov rbx, rdx
     mov rcx, rax
     call scene_index
@@ -2031,19 +2111,118 @@ select_scenes PROC
     ret
 select_scenes ENDP
 
-; rcx = tab text, edx = position
-tab_add PROC
+; Shows the connection text (Connection page) and the status row: the dot,
+; recolored by WM_CTLCOLORSTATIC, and the latest event or connection state
+update_status PROC
     sub rsp, 28h
-    mov dword ptr g_tci, 1          ; TCIF_TEXT
-    mov qword ptr g_tci+16, rcx
-    mov r8d, edx
-    mov ecx, IDC_TAB
-    mov edx, 1307h                  ; TCM_INSERTITEMA
-    lea r9, g_tci
-    call send_dlg
+    CS_ENTER
+    mov ecx, IDC_CONN
+    lea rdx, g_stat_conn
+    call set_text_u8
+    mov eax, g_connstate
+    lea rdx, s_notconn
+    cmp eax, 1
+    jne us_2
+    lea rdx, s_connecting
+us_2:
+    cmp eax, 3
+    jne us_3
+    lea rdx, s_cantconn
+us_3:
+    cmp eax, 2
+    jne us_set
+    lea rdx, s_connectd
+    cmp byte ptr g_stat_event, 0
+    je us_set
+    lea rdx, g_stat_event
+us_set:
+    mov ecx, IDC_STATUS
+    call set_text_u8
+    CS_LEAVE
+    mov ecx, IDC_DOT
+    lea rdx, s_dot
+    call set_text_u8
     add rsp, 28h
     ret
-tab_add ENDP
+update_status ENDP
+
+; Fill the page list
+refresh_nav PROC
+    push rbx
+    sub rsp, 20h
+    mov ecx, IDC_NAV
+    mov edx, 184h                   ; LB_RESETCONTENT
+    xor r8d, r8d
+    xor r9d, r9d
+    call send_dlg
+    mov ecx, IDC_NAV
+    mov edx, 180h                   ; LB_ADDSTRING
+    lea r8, s_navconn
+    call add_string
+    mov ecx, IDC_NAV
+    mov edx, 180h
+    lea r8, s_sp
+    call add_string
+    mov ecx, IDC_NAV
+    mov edx, 180h
+    lea r8, s_mp
+    call add_string
+    mov ecx, IDC_NAV
+    mov edx, 180h
+    lea r8, s_navfile
+    call add_string
+    mov ecx, IDC_NAV
+    mov edx, 186h                   ; LB_SETCURSEL
+    mov r8d, g_page
+    xor r9d, r9d
+    call send_dlg
+    add rsp, 20h
+    pop rbx
+    ret
+refresh_nav ENDP
+
+; Show the controls of page g_page and hide the rest
+show_page PROC
+    push rbx
+    push rsi
+    push rdi
+    sub rsp, 20h
+    mov ecx, g_page
+    mov edi, 1
+    shl edi, cl
+    test edi, 6                     ; a mode page: "Use this mode" or "This mode is active"
+    jz sp_go
+    mov eax, g_view
+    cmp eax, g_mode
+    mov eax, 80h
+    jne sp_btn
+    mov eax, 40h
+sp_btn:
+    or edi, eax
+sp_go:
+    lea rsi, page_tbl
+sp_l:
+    movzx edx, word ptr [rsi]
+    test edx, edx
+    jz sp_ret
+    mov rcx, g_hDlg
+    call [__imp_GetDlgItem]
+    xor edx, edx                    ; SW_HIDE
+    test di, word ptr [rsi+2]
+    jz sp_show
+    mov edx, 5                      ; SW_SHOW
+sp_show:
+    mov rcx, rax
+    call [__imp_ShowWindow]
+    add rsi, 4
+    jmp sp_l
+sp_ret:
+    add rsp, 20h
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+show_page ENDP
 
 ; Fill both scene dropdowns from g_scenes and select the saved scenes
 fill_scenes PROC
@@ -2063,20 +2242,23 @@ fill_scenes PROC
     xor r9d, r9d
     call send_dlg
     mov ecx, IDC_MENU
-    lea rdx, s_noneitem
-    call combo_add
+    mov edx, 143h                   ; CB_ADDSTRING
+    lea r8, s_noneitem
+    call add_string
     xor ebx, ebx
 fc_l:
     cmp ebx, g_nscenes
     jae fc_sel
     lea rax, g_scenes
-    mov rdx, [rax+rbx*8]
+    mov r8, [rax+rbx*8]
     mov ecx, IDC_SONG
-    call combo_add
+    mov edx, 143h
+    call add_string
     lea rax, g_scenes
-    mov rdx, [rax+rbx*8]
+    mov r8, [rax+rbx*8]
     mov ecx, IDC_MENU
-    call combo_add
+    mov edx, 143h
+    call add_string
     inc ebx
     jmp fc_l
 fc_sel:
@@ -2097,10 +2279,13 @@ fc_sel:
     CS_LEAVE
     test esi, esi
     jz fc_ret
-    mov ecx, IDC_EVENT
+    CS_ENTER
+    lea rcx, g_stat_event
     lea rdx, ev_missing
-    call set_text_u8
+    call stpcpy
+    CS_LEAVE
 fc_ret:
+    call update_status
     add rsp, 28h
     pop rsi
     pop rbx
@@ -2131,8 +2316,20 @@ DlgProc PROC
     je dp_scenes
     cmp edx, WM_APP_TRAY
     je dp_tray
-    cmp edx, 4Eh                    ; WM_NOTIFY
-    je dp_notify
+    cmp edx, 138h                   ; WM_CTLCOLORSTATIC
+    je dp_ctlstatic
+    cmp edx, 136h                   ; WM_CTLCOLORDLG
+    je dp_bg
+    cmp edx, 135h                   ; WM_CTLCOLORBTN
+    je dp_bg
+    cmp edx, 133h                   ; WM_CTLCOLOREDIT
+    je dp_ctledit
+    cmp edx, 134h                   ; WM_CTLCOLORLISTBOX
+    je dp_ctllist
+    cmp edx, 2Bh                    ; WM_DRAWITEM
+    je dp_drawitem
+    cmp edx, 2Ch                    ; WM_MEASUREITEM
+    je dp_measure
 dp_false:
     xor eax, eax
     jmp dp_ret
@@ -2148,6 +2345,30 @@ dp_ret:
 
 dp_init:
     mov g_hDlg, rbx
+    ; dark title bar and dark text boxes, dropdowns and buttons
+    mov rcx, rbx
+    mov edx, 20                     ; DWMWA_USE_IMMERSIVE_DARK_MODE
+    lea r8, g_one
+    mov r9d, 4
+    call [__imp_DwmSetWindowAttribute]
+    lea r12, theme_tbl
+di_theme:
+    movzx edx, word ptr [r12]
+    test edx, edx
+    jz di_themed
+    mov rcx, rbx
+    call [__imp_GetDlgItem]
+    mov rcx, rax
+    lea rdx, w_darkcfd
+    cmp word ptr [r12+2], 0
+    je di_settheme
+    lea rdx, w_darkexp
+di_settheme:
+    xor r8d, r8d
+    call [__imp_SetWindowTheme]
+    add r12, 4
+    jmp di_theme
+di_themed:
     mov ecx, IDC_HOST
     lea rdx, g_host
     call set_text_u8
@@ -2165,21 +2386,19 @@ dp_init:
     mov edx, IDC_FILE
     lea r8, g_file
     call [__imp_SetDlgItemTextA]
-    ; Singleplayer / Multiplayer tabs, drawn so the labels blend with the tab
-    mov rcx, rbx
-    mov edx, 6                      ; ETDT_ENABLETAB
-    call [__imp_EnableThemeDialogTexture]
-    lea rcx, s_sp
-    xor edx, edx
-    call tab_add
-    lea rcx, s_mp
-    mov edx, 1
-    call tab_add
-    mov ecx, IDC_TAB
-    mov edx, 130Ch                  ; TCM_SETCURSEL
-    mov r8d, g_mode
-    xor r9d, r9d
-    call send_dlg
+    ; start on the active mode's page, or on Connection the first time
+    mov eax, g_mode
+    mov g_view, eax
+    inc eax
+    cmp byte ptr g_song, 0
+    jne di_page
+    cmp byte ptr g_mpsong, 0
+    jne di_page
+    xor eax, eax
+di_page:
+    mov g_page, eax
+    call refresh_nav
+    call show_page
     ; tray icon
     mov dword ptr g_nid, 528
     mov qword ptr g_nid+8, rbx
@@ -2211,12 +2430,14 @@ dp_init:
     cmp byte ptr g_mpsong, 0
     je di_new
 di_auto:
+    call update_status
     call request_connect
     jmp dp_true
 di_new:
-    mov ecx, IDC_CONN
+    lea rcx, g_stat_conn
     lea rdx, st_enter
-    call set_text_u8
+    call stpcpy
+    call update_status
     jmp dp_true
 
 dp_cmd:
@@ -2235,11 +2456,56 @@ dp_cmd:
     je dc_file
     cmp eax, IDC_BROWSE
     je dc_browse
+    cmp eax, IDC_NAV
+    je dc_nav
+    cmp eax, IDC_USEMODE
+    je dc_usemode
     jmp dp_true                     ; swallow Enter/Esc (IDOK/IDCANCEL)
+
+dc_nav:
+    cmp r12d, 1                     ; LBN_SELCHANGE
+    jne dp_true
+    mov ecx, IDC_NAV
+    mov edx, 188h                   ; LB_GETCURSEL
+    xor r8d, r8d
+    xor r9d, r9d
+    call send_dlg
+    cmp eax, 3
+    ja dp_true
+    mov g_page, eax
+    dec eax                         ; a mode page -> the mode being viewed
+    cmp eax, 1
+    ja dn_show
+    mov g_view, eax
+    CS_ENTER
+    call select_scenes
+    CS_LEAVE
+dn_show:
+    call show_page
+    jmp dp_true
+
+dc_usemode:
+    test r12d, r12d
+    jnz dp_true
+    mov r12d, g_view
+    CS_ENTER
+    mov g_mode, r12d
+    lea eax, [r12+'0']
+    mov byte ptr g_modestr, al
+    mov byte ptr g_modestr+1, 0
+    CS_LEAVE
+    call save_settings
+    mov g_modechg, 1                ; the worker moves OBS to the new mode's scene
+    mov rcx, g_hEvent
+    call [__imp_SetEvent]
+    call show_page
+    jmp dp_true
 
 dc_connect:
     test r12d, r12d
     jnz dp_true
+    cmp g_page, 0                   ; Enter on another page
+    jne dp_true
     mov ecx, IDC_PORT
     lea rdx, g_uitmp
     mov r8d, 16
@@ -2284,14 +2550,12 @@ dc_song:
     CS_ENTER
     cmp r12d, g_nscenes
     jae dc_unlock
-    call active_bufs
+    call view_bufs
     mov rcx, rax
     lea rax, g_scenes
     mov rdx, [rax+r12*8]
     call stpcpy
-    mov ecx, IDC_EVENT              ; drop the "pick a scene" hint
-    lea rdx, s_empty
-    call set_text_u8
+    mov byte ptr g_stat_event, 0    ; drop the "pick a scene" hint
     jmp dc_unlock
 
 dc_menu:
@@ -2304,7 +2568,7 @@ dc_menu:
     call send_dlg
     mov r12d, eax
     CS_ENTER
-    call active_bufs
+    call view_bufs
     mov rdi, rdx
     mov byte ptr [rdi], 0
     test r12d, r12d                 ; item 0 = "(none)"
@@ -2319,6 +2583,7 @@ dc_menu:
 dc_unlock:
     CS_LEAVE
     call save_settings
+    call update_status
     jmp dp_true
 
 dc_delay:
@@ -2408,42 +2673,114 @@ dp_close:
     jmp dp_true
 
 dp_status:
-    CS_ENTER
-    mov ecx, IDC_CONN
-    lea rdx, g_stat_conn
-    call set_text_u8
-    mov ecx, IDC_EVENT
-    lea rdx, g_stat_event
-    call set_text_u8
-    CS_LEAVE
+    call update_status
     jmp dp_true
 
 dp_scenes:
     call fill_scenes
     jmp dp_true
 
-dp_notify:
-    cmp qword ptr [rdi+8], IDC_TAB  ; NMHDR.idFrom
+dp_ctlstatic:
+    mov rcx, rdi
+    call [__imp_GetDlgCtrlID]
+    cmp eax, IDC_DIVIDER
+    je dp_div
+    mov edx, CLR_MUTED
+    cmp eax, IDC_DOT
+    jne cs_color
+    mov eax, g_connstate
+    mov edx, CLR_DOTOFF
+    cmp eax, 2
+    jne cs_dot3
+    mov edx, CLR_DOTOK
+cs_dot3:
+    cmp eax, 3
+    jne cs_color
+    mov edx, CLR_DOTERR
+cs_color:
+    mov rcx, rsi
+    call [__imp_SetTextColor]
+    mov rcx, rsi
+    mov edx, 1                      ; TRANSPARENT
+    call [__imp_SetBkMode]
+dp_bg:
+    mov rax, g_hBgBrush
+    jmp dp_ret
+dp_div:
+    mov rax, g_hDivBrush
+    jmp dp_ret
+
+dp_ctllist:
+    mov rcx, rdi
+    call [__imp_GetDlgCtrlID]
+    cmp eax, IDC_NAV                ; the page list sits on the window background
+    je dp_bg
+dp_ctledit:                         ; text boxes and dropdown lists
+    mov rcx, rsi
+    mov edx, CLR_TEXT
+    call [__imp_SetTextColor]
+    mov rcx, rsi
+    mov edx, CLR_FIELD
+    call [__imp_SetBkColor]
+    mov rax, g_hFieldBrush
+    jmp dp_ret
+
+dp_measure:
+    cmp dword ptr [rdi+4], IDC_NAV  ; MEASUREITEMSTRUCT.CtlID
     jne dp_false
-    cmp dword ptr [rdi+16], -551    ; TCN_SELCHANGE
+    and qword ptr g_rc, 0
+    mov dword ptr g_rc+8, 7         ; text inset, dialog units
+    mov dword ptr g_rc+12, 15       ; item height, dialog units
+    mov rcx, rbx
+    lea rdx, g_rc
+    call [__imp_MapDialogRect]
+    mov eax, dword ptr g_rc+8
+    mov g_navpad, eax
+    mov eax, dword ptr g_rc+12
+    mov dword ptr [rdi+16], eax     ; itemHeight
+    jmp dp_true
+
+dp_drawitem:
+    cmp dword ptr [rdi+4], IDC_NAV  ; DRAWITEMSTRUCT.CtlID
     jne dp_false
-    mov ecx, IDC_TAB
-    mov edx, 130Bh                  ; TCM_GETCURSEL
-    xor r8d, r8d
-    xor r9d, r9d
+    cmp dword ptr [rdi+8], -1       ; itemID: empty list
+    je dp_true
+    mov r12d, dword ptr [rdi+16]    ; itemState
+    and r12d, 1                     ; ODS_SELECTED
+    mov r8, g_hSelBrush
+    jnz dd_fill
+    mov r8, g_hBgBrush
+dd_fill:
+    mov rcx, [rdi+32]               ; hDC
+    lea rdx, [rdi+40]               ; rcItem
+    call [__imp_FillRect]
+    mov rcx, [rdi+32]
+    mov edx, 1                      ; TRANSPARENT
+    call [__imp_SetBkMode]
+    mov edx, CLR_MUTED
+    test r12d, r12d
+    jz dd_text
+    mov edx, CLR_ACCENT
+dd_text:
+    mov rcx, [rdi+32]
+    call [__imp_SetTextColor]
+    mov ecx, IDC_NAV
+    mov edx, 189h                   ; LB_GETTEXT
+    mov r8d, dword ptr [rdi+8]
+    lea r9, g_wtmp
     call send_dlg
-    mov r12d, eax
-    CS_ENTER
-    mov g_mode, r12d
-    lea eax, [r12+'0']
-    mov byte ptr g_modestr, al
-    mov byte ptr g_modestr+1, 0
-    call select_scenes
-    CS_LEAVE
-    call save_settings
-    mov g_modechg, 1
-    mov rcx, g_hEvent
-    call [__imp_SetEvent]
+    mov rax, [rdi+40]
+    mov qword ptr g_rc, rax
+    mov rax, [rdi+48]
+    mov qword ptr g_rc+8, rax
+    mov eax, g_navpad
+    add dword ptr g_rc, eax
+    mov rcx, [rdi+32]
+    lea rdx, g_wtmp
+    mov r8d, -1
+    lea r9, g_rc
+    mov qword ptr [rsp+20h], 24h    ; DT_SINGLELINE | DT_VCENTER
+    call [__imp_DrawTextW]
     jmp dp_true
 
 dp_tray:
@@ -2519,6 +2856,16 @@ mn_dl:
     mov g_delayms, rax
     lea rcx, g_cs
     call [__imp_InitializeCriticalSection]
+    xor ebx, ebx
+mn_br:
+    lea rax, brush_clr
+    mov ecx, [rax+rbx*4]
+    call [__imp_CreateSolidBrush]
+    lea rcx, g_hBgBrush
+    mov [rcx+rbx*8], rax
+    inc ebx
+    cmp ebx, 4
+    jb mn_br
     xor ecx, ecx
     xor edx, edx                    ; auto-reset
     xor r8d, r8d

@@ -13,7 +13,7 @@ rc /nologo /fo chss.res chss.rc || exit /b 1
 rem Standard layout on purpose: separate read-only code and writable data
 rem sections, ASLR, and an embedded manifest. Merging sections or dropping
 rem these makes the exe a few KB smaller but trips antivirus heuristics.
-link /nologo chss.obj chss.res kernel32.lib user32.lib shell32.lib comdlg32.lib comctl32.lib uxtheme.lib ^
+link /nologo chss.obj chss.res kernel32.lib user32.lib shell32.lib comdlg32.lib comctl32.lib gdi32.lib uxtheme.lib dwmapi.lib ^
   winhttp.lib bcrypt.lib crypt32.lib ^
   /OUT:"CH Scene Switcher.exe" /SUBSYSTEM:WINDOWS /ENTRY:main /NODEFAULTLIB ^
   /DYNAMICBASE /NXCOMPAT /DEBUG:NONE /OPT:REF ^
