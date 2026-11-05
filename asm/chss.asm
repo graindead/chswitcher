@@ -72,6 +72,8 @@ IMP GetOpenFileNameA
 IMP InitCommonControls
 IMP GetDlgItem
 IMP MoveWindow
+IMP GetWindowPlacement
+IMP SetWindowPlacement
 IMP SetWindowPos
 IMP EnableWindow
 IMP ShellExecuteA
@@ -104,6 +106,7 @@ IMP WinHttpWebSocketQueryCloseStatus
 IMP WinHttpCloseHandle
 IMP WinHttpReadData
 IMP IsWindowVisible
+IMP IsIconic
 IMP BCryptHash
 IMP CryptBinaryToStringA
 IMP CryptStringToBinaryA
@@ -124,7 +127,7 @@ endm
 RBUF_SIZE   equ 262144
 TEXTSIZE    equ 4096
 MAXSCENES   equ 256
-NSET        equ 18
+NSET        equ 20
 REQ_POLL_MS equ 5000
 REQ_MAX     equ 100             ; requests shown
 RESP_SIZE   equ 131072
@@ -170,6 +173,8 @@ IDL_CHATCMD equ 134
 IDC_CHATCMD equ 135
 IDC_ONTOP   equ 136
 IDL_ONTOP   equ 137
+IDC_TRAY    equ 138
+IDL_TRAY    equ 139
 ID_SHOW     equ 200
 ID_EXIT     equ 201
 
@@ -237,6 +242,9 @@ k_twid      db 'twitch_user_id',0
 k_twlogin   db 'twitch_login',0
 k_chatcmd   db 'next_chat_command',0
 k_ontop     db 'keep_on_top',0
+k_winpos    db 'window',0
+k_tray      db 'minimize_to_tray',0
+d_one       db '1',0
 d_chatcmd   db '!playnext',0
 d_host      db 'localhost',0
 d_port      db '4455',0
@@ -428,6 +436,8 @@ settings_secret label qword
              dq k_twlogin, g_twlogin, 64, s_empty
              dq k_chatcmd, g_chatcmd, 64, d_chatcmd
              dq k_ontop, g_ontop, 4, d_delay       ; "1" = keep the window on top
+             dq k_winpos, g_winpos, 64, s_empty    ; x,y,width,height,maximized
+             dq k_tray, g_tray, 4, d_one           ; "1" = minimizing hides to the tray
 ; settings.json patterns, in settings_tbl order (ending in " = string value, else number)
 mig_tbl      dq m_host, m_port, m_pass, m_song, m_menu, m_delay, m_file, 0
 sfx_tbl      dq sfx1, sfx2, sfx3, 0
@@ -438,13 +448,13 @@ layout_tbl   dw IDC_NAV, 8, IDC_DIVIDER, 8, IDC_REQLIST, 12, IDC_NEXT, 2, IDC_NE
              dw IDC_CONNECT, 1, IDC_CONN, 4, IDL_OUVERT, 4, IDC_OUVERT, 4, IDL_OUVERTP, 4, IDC_OUVERTP, 4
              dw IDL_FILE, 4, IDC_FILE, 4, IDC_BROWSE, 1, IDC_DELAY, 1
              dw IDL_SONG, 4, IDC_SONG, 4, IDL_MENU, 4, IDC_MENU, 4
-             dw IDC_TWSTAT, 4, IDC_TWBTN, 1, IDC_CHATCMD, 1, IDC_ONTOP, 1
+             dw IDC_TWSTAT, 4, IDC_TWBTN, 1, IDC_CHATCMD, 1, IDC_ONTOP, 1, IDC_TRAY, 1
              dw IDC_DOT, 2, IDC_STATUS, 6, IDC_USEMODE, 3, IDC_ACTIVE, 3, 0
 ; brushes made in main, in g_hBgBrush order
 brush_clr    dd CLR_BG, CLR_FIELD, CLR_SELBG, CLR_DIVIDER
 ; controls drawn with Windows' dark styles: 0 = DarkMode_CFD (fields), 1 = DarkMode_Explorer (buttons)
 theme_tbl    dw IDC_HOST, 0, IDC_PORT, 0, IDC_PASS, 0, IDC_FILE, 0, IDC_DELAY, 0
-             dw IDC_SONG, 0, IDC_MENU, 0, IDC_OUVERT, 0, IDC_OUVERTP, 0, IDC_REQLIST, 1, IDC_NEXT, 1, IDC_TWBTN, 1, IDC_ONTOP, 1, IDC_CHATCMD, 0, IDC_CONNECT, 1, IDC_BROWSE, 1, IDC_USEMODE, 1, 0
+             dw IDC_SONG, 0, IDC_MENU, 0, IDC_OUVERT, 0, IDC_OUVERTP, 0, IDC_REQLIST, 1, IDC_NEXT, 1, IDC_TWBTN, 1, IDC_ONTOP, 1, IDC_TRAY, 1, IDC_CHATCMD, 0, IDC_CONNECT, 1, IDC_BROWSE, 1, IDC_USEMODE, 1, 0
 w_darkcfd    dw 'D','a','r','k','M','o','d','e','_','C','F','D',0
 w_darkexp    dw 'D','a','r','k','M','o','d','e','_','E','x','p','l','o','r','e','r',0
 align 4
@@ -455,7 +465,7 @@ page_tbl     dw IDL_HOST, 8, IDC_HOST, 8, IDL_PORT, 8, IDC_PORT, 8
              dw IDL_PASS, 8, IDC_PASS, 8, IDC_CONNECT, 8, IDC_CONN, 8
              dw IDL_OUVERT, 8, IDC_OUVERT, 8, IDL_OUVERTP, 8, IDC_OUVERTP, 8
              dw IDL_FILE, 8, IDC_FILE, 8, IDC_BROWSE, 8
-             dw IDL_DELAY, 8, IDC_DELAY, 8, IDC_TWSTAT, 8, IDC_TWBTN, 8, IDL_CHATCMD, 8, IDC_CHATCMD, 8, IDL_ONTOP, 8, IDC_ONTOP, 8
+             dw IDL_DELAY, 8, IDC_DELAY, 8, IDC_TWSTAT, 8, IDC_TWBTN, 8, IDL_CHATCMD, 8, IDC_CHATCMD, 8, IDL_ONTOP, 8, IDC_ONTOP, 8, IDL_TRAY, 8, IDC_TRAY, 8
              dw IDL_SONG, 6, IDC_SONG, 6, IDL_MENU, 6, IDC_MENU, 6
              dw IDC_REQLIST, 1, IDC_NEXT, 1, IDC_NEXTMSG, 1
              dw IDC_USEMODE, 80h, IDC_ACTIVE, 40h, 0
@@ -511,6 +521,7 @@ g_modechg   dd ?            ; set by the UI when the active mode changes
 g_connstate dd ?            ; 0 not connected, 1 connecting, 2 connected, 3 can't connect
 g_cw0       dd ?            ; client size the controls were laid out for
 g_ch0       dd ?
+g_pl        dd 11 dup(?)    ; WINDOWPLACEMENT (44 bytes)
 g_minw      dd ?            ; smallest window size
 g_minh      dd ?
 g_laydone   dd ?
@@ -585,6 +596,8 @@ g_twid      db 32 dup(?)
 g_twlogin   db 64 dup(?)
 g_chatcmd   db 64 dup(?)
 g_ontop     db 4 dup(?)
+g_tray      db 4 dup(?)
+g_winpos    db 64 dup(?)
 g_twstat    db 512 dup(?)
 g_nextmsg   db 512 dup(?)   ; result of Next song (under g_cs)
 r_nmsg      db 512 dup(?)
@@ -3639,6 +3652,10 @@ rt_page:
     call [__imp_IsWindowVisible]
     test eax, eax
     jz rt_loop
+    mov rcx, g_hDlg
+    call [__imp_IsIconic]           ; minimized to the taskbar
+    test eax, eax
+    jnz rt_loop
     CS_ENTER
     lea rcx, r_key
     lea rdx, g_ouvert
@@ -4146,6 +4163,150 @@ ao_set:
     ret
 apply_ontop ENDP
 
+; ecx = signed value, rdx = dst -> rax = dst's terminating zero
+itoa_s PROC
+    test ecx, ecx
+    jns is_pos
+    mov byte ptr [rdx], '-'
+    inc rdx
+    neg ecx
+is_pos:
+    mov ecx, ecx
+    jmp utoa
+itoa_s ENDP
+
+; rcx = text: reads a signed number and the comma after it -> eax = value,
+; rcx moved past them, r8d = digits read (leaf)
+atoi_s PROC
+    xor eax, eax
+    xor r8d, r8d
+    xor r9d, r9d                    ; negative
+    cmp byte ptr [rcx], '-'
+    jne as_l
+    inc r9d
+    inc rcx
+as_l:
+    movzx edx, byte ptr [rcx]
+    sub edx, '0'
+    cmp edx, 9
+    ja as_end
+    cmp r8d, 7                      ; far beyond any screen
+    jae as_end
+    imul eax, eax, 10
+    add eax, edx
+    inc r8d
+    inc rcx
+    jmp as_l
+as_end:
+    test r9d, r9d
+    jz as_com
+    neg eax
+as_com:
+    cmp byte ptr [rcx], ','
+    jne as_ret
+    inc rcx
+as_ret:
+    ret
+atoi_s ENDP
+
+; Records the window's normal position and size, and whether it's maximized, in g_winpos
+win_capture PROC
+    push rbx
+    sub rsp, 20h
+    mov dword ptr g_pl, 44
+    mov rcx, g_hDlg
+    lea rdx, g_pl
+    call [__imp_GetWindowPlacement]
+    test eax, eax
+    jz wc2_ret
+    lea rbx, g_winpos
+    mov ecx, dword ptr g_pl+28      ; rcNormalPosition.left
+    mov rdx, rbx
+    call itoa_s
+    mov byte ptr [rax], ','
+    lea rbx, [rax+1]
+    mov ecx, dword ptr g_pl+32      ; .top
+    mov rdx, rbx
+    call itoa_s
+    mov byte ptr [rax], ','
+    lea rbx, [rax+1]
+    mov ecx, dword ptr g_pl+36      ; .right
+    sub ecx, dword ptr g_pl+28
+    mov rdx, rbx
+    call itoa_s
+    mov byte ptr [rax], ','
+    lea rbx, [rax+1]
+    mov ecx, dword ptr g_pl+40      ; .bottom
+    sub ecx, dword ptr g_pl+32
+    mov rdx, rbx
+    call itoa_s
+    mov byte ptr [rax], ','
+    xor ecx, ecx
+    cmp dword ptr g_pl+8, 3         ; SW_SHOWMAXIMIZED
+    sete cl
+    add cl, '0'
+    mov [rax+1], cl
+    mov byte ptr [rax+2], 0
+wc2_ret:
+    add rsp, 20h
+    pop rbx
+    ret
+win_capture ENDP
+
+; Puts the window where g_winpos says, if it holds five numbers. Windows pulls it back
+; on screen if that place no longer exists, e.g. after unplugging a monitor.
+win_restore PROC
+    sub rsp, 28h
+    lea rcx, g_winpos
+    call atoi_s
+    test r8d, r8d
+    jz wr_ret
+    mov dword ptr g_pl+28, eax
+    call atoi_s
+    test r8d, r8d
+    jz wr_ret
+    mov dword ptr g_pl+32, eax
+    call atoi_s
+    test r8d, r8d
+    jz wr_ret
+    cmp eax, g_minw                 ; never smaller than the layout needs
+    jge wr_w
+    mov eax, g_minw
+wr_w:
+    add eax, dword ptr g_pl+28
+    mov dword ptr g_pl+36, eax
+    call atoi_s
+    test r8d, r8d
+    jz wr_ret
+    cmp eax, g_minh
+    jge wr_h
+    mov eax, g_minh
+wr_h:
+    add eax, dword ptr g_pl+32
+    mov dword ptr g_pl+40, eax
+    call atoi_s
+    test r8d, r8d
+    jz wr_ret
+    mov edx, 1                      ; SW_SHOWNORMAL
+    cmp eax, 1
+    jne wr_set
+    mov edx, 3                      ; SW_SHOWMAXIMIZED
+wr_set:
+    mov dword ptr g_pl, 44
+    and dword ptr g_pl+4, 0
+    mov dword ptr g_pl+8, edx
+    mov dword ptr g_pl+12, -1       ; ptMinPosition, ptMaxPosition: default
+    mov dword ptr g_pl+16, -1
+    mov dword ptr g_pl+20, -1
+    mov dword ptr g_pl+24, -1
+    mov rcx, g_hDlg
+    lea rdx, g_pl
+    call [__imp_SetWindowPlacement]
+wr_ret:
+    add rsp, 28h
+    ret
+win_restore ENDP
+
 ; Fill the page list
 refresh_nav PROC
     push rbx
@@ -4318,6 +4479,8 @@ DlgProc PROC
     je dp_tray
     cmp edx, WM_APP_REQS
     je dp_reqs
+    cmp edx, 232h                   ; WM_EXITSIZEMOVE
+    je dp_moved
     cmp edx, WM_APP_NEXTDONE
     je dp_nextdone
     cmp edx, WM_APP_TWITCH
@@ -4431,6 +4594,14 @@ di_page:
     call refresh_nav
     call show_page
     call layout_init
+    call win_restore
+    xor r8d, r8d
+    cmp byte ptr g_tray, '1'
+    sete r8b
+    mov ecx, IDC_TRAY
+    mov edx, 0F1h                   ; BM_SETCHECK
+    xor r9d, r9d
+    call send_dlg
     xor r8d, r8d
     cmp byte ptr g_ontop, '1'
     sete r8b
@@ -4452,8 +4623,11 @@ di_page:
     lea rcx, g_nid+40
     lea rdx, s_title
     call stpcpy
+    cmp byte ptr g_tray, '1'
+    jne di_notray
     xor ecx, ecx                    ; NIM_ADD
     call tray_icon
+di_notray:
     ; worker thread
     xor ecx, ecx
     xor edx, edx
@@ -4521,6 +4695,8 @@ dp_cmd:
     je dc_chatcmd
     cmp eax, IDC_ONTOP
     je dc_ontop
+    cmp eax, IDC_TRAY
+    je dc_tray
     jmp dp_true                     ; swallow Enter/Esc (IDOK/IDCANCEL)
 
 dc_ouvert:
@@ -4555,6 +4731,26 @@ dc_ontop:
     mov byte ptr g_ontop, al
     mov byte ptr g_ontop+1, 0
     call apply_ontop
+    call save_settings
+    jmp dp_true
+
+dc_tray:
+    test r12d, r12d                 ; BN_CLICKED
+    jnz dp_true
+    mov ecx, IDC_TRAY
+    mov edx, 0F0h                   ; BM_GETCHECK
+    xor r8d, r8d
+    xor r9d, r9d
+    call send_dlg
+    add al, '0'
+    mov byte ptr g_tray, al
+    mov byte ptr g_tray+1, 0
+    mov ecx, 2                      ; NIM_DELETE
+    cmp al, '1'
+    jne dt_icon
+    xor ecx, ecx                    ; NIM_ADD
+dt_icon:
+    call tray_icon
     call save_settings
     jmp dp_true
 
@@ -4814,7 +5010,9 @@ db_open:
 dp_syscmd:
     mov eax, esi
     and eax, 0FFF0h
-    cmp eax, 0F020h                 ; SC_MINIMIZE: hide to the tray instead
+    cmp eax, 0F020h                 ; SC_MINIMIZE: hide to the tray if that's turned on
+    jne dp_false
+    cmp byte ptr g_tray, '1'
     jne dp_false
     mov rcx, rbx
     xor edx, edx                    ; SW_HIDE
@@ -4822,6 +5020,8 @@ dp_syscmd:
     jmp dp_true
 
 dp_close:
+    call win_capture
+    call save_settings
     mov ecx, 2                      ; NIM_DELETE
     call tray_icon
     mov rcx, rbx
@@ -4839,6 +5039,11 @@ dp_scenes:
 
 dp_reqs:
     call req_show
+    jmp dp_true
+
+dp_moved:
+    call win_capture
+    call save_settings
     jmp dp_true
 
 dp_twitch:

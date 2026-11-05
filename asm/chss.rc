@@ -38,16 +38,18 @@
 #define IDC_CHATCMD 135
 #define IDC_ONTOP   136
 #define IDL_ONTOP   137
+#define IDC_TRAY    138
+#define IDL_TRAY    139
 
 // Two panes: the page list on the left (drawn by the app), the selected page on
 // the right. Every page's controls are here; the app shows only the current page's.
-1 DIALOGEX 0, 0, 250, 248
+1 DIALOGEX 0, 0, 250, 262
 STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME | WS_CLIPCHILDREN
 CAPTION "CH Scene Switcher"
 FONT 9, "Segoe UI"
 BEGIN
-    CONTROL         "", IDC_NAV, "ListBox", LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_TABSTOP, 0, 4, 66, 244
-    LTEXT           "", IDC_DIVIDER, 66, 0, 1, 248
+    CONTROL         "", IDC_NAV, "ListBox", LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_TABSTOP, 0, 4, 66, 258
+    LTEXT           "", IDC_DIVIDER, 66, 0, 1, 262
 
     // Settings
     LTEXT           "Server IP", IDL_HOST, 76, 8, 114, 8
@@ -73,6 +75,8 @@ BEGIN
     EDITTEXT        IDC_CHATCMD, 188, 197, 54, 12, ES_AUTOHSCROLL
     LTEXT           "Keep window on top", IDL_ONTOP, 76, 216, 110, 8
     CONTROL         "", IDC_ONTOP, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 232, 215, 10, 10
+    LTEXT           "Minimize to system tray", IDL_TRAY, 76, 230, 110, 8
+    CONTROL         "", IDC_TRAY, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 232, 229, 10, 10
 
     // Singleplayer / Multiplayer (same controls, showing the selected mode's scenes)
     LTEXT           "Song playing", IDL_SONG, 76, 8, 166, 8
@@ -81,20 +85,20 @@ BEGIN
     COMBOBOX        IDC_MENU, 76, 46, 166, 200, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 
     // Requests
-    LISTBOX         IDC_REQLIST, 76, 8, 166, 196, LBS_NOSEL | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL | NOT WS_BORDER
-    PUSHBUTTON      "Next song", IDC_NEXT, 76, 208, 50, 14
-    LTEXT           "", IDC_NEXTMSG, 132, 211, 110, 9, SS_ENDELLIPSIS | SS_NOPREFIX
+    LISTBOX         IDC_REQLIST, 76, 8, 166, 210, LBS_NOSEL | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL | NOT WS_BORDER
+    PUSHBUTTON      "Next song", IDC_NEXT, 76, 222, 50, 14
+    LTEXT           "", IDC_NEXTMSG, 132, 225, 110, 9, SS_ENDELLIPSIS | SS_NOPREFIX
 
     // status row, on every page
-    LTEXT           "", IDC_DOT, 76, 231, 7, 9, SS_NOPREFIX
-    LTEXT           "", IDC_STATUS, 84, 231, 100, 9, SS_ENDELLIPSIS | SS_NOPREFIX
-    PUSHBUTTON      "Use this mode", IDC_USEMODE, 186, 228, 56, 14
-    RTEXT           "Active mode", IDC_ACTIVE, 186, 231, 56, 9
+    LTEXT           "", IDC_DOT, 76, 245, 7, 9, SS_NOPREFIX
+    LTEXT           "", IDC_STATUS, 84, 245, 100, 9, SS_ENDELLIPSIS | SS_NOPREFIX
+    PUSHBUTTON      "Use this mode", IDC_USEMODE, 186, 242, 56, 14
+    RTEXT           "Active mode", IDC_ACTIVE, 186, 245, 56, 9
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,7,0,0
-PRODUCTVERSION  1,7,0,0
+FILEVERSION     1,7,1,0
+PRODUCTVERSION  1,7,1,0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
@@ -103,11 +107,11 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "FileDescription",  "Switches OBS scenes when Clone Hero starts and ends songs"
-            VALUE "FileVersion",      "1.7.0.0"
+            VALUE "FileVersion",      "1.7.1.0"
             VALUE "InternalName",     "chss"
             VALUE "OriginalFilename", "CH Scene Switcher.exe"
             VALUE "ProductName",      "CH Scene Switcher"
-            VALUE "ProductVersion",   "1.7.0.0"
+            VALUE "ProductVersion",   "1.7.1.0"
         END
     END
     BLOCK "VarFileInfo"

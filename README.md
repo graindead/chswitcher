@@ -46,7 +46,7 @@ on its page. Looking at a page doesn't change anything in OBS; click **Use this 
 switches straight away: to that mode's song scene if a song is playing, or to its menu scene if you're in the menus.
 
 Settings are saved as you change them, in `%APPDATA%\CH Scene Switcher\settings.ini`. The next time you start the app it
-connects and starts watching by itself. Minimizing hides it to the system tray. Click the tray icon to bring it back,
+connects and starts watching by itself. Minimizing hides it to the system tray, unless you turn that off on **Settings**. Click the tray icon to bring it back,
 or right-click it to exit.
 
 The OBS password is stored in plain text in `settings.ini`, so don't share that file.
