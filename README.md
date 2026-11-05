@@ -8,7 +8,7 @@ one scene while a song is playing, another in the menus.
 It watches the `currentsong.txt` file Clone Hero writes. When the file gets text a song has started,
 and when it is emptied the song has ended. Scenes are switched through OBS's built-in WebSocket server.
 
-The main program is a 22 KB Windows app written in x64 assembly, with no installer and no runtime to install.
+The main program is a tiny Windows app written in x64 assembly, with no installer and no runtime to install.
 
 ## Use
 
