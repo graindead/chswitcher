@@ -5,10 +5,13 @@
 ;   file gets text (song started)  -> song scene
 ;   file emptied (song ended/quit) -> menu scene, after an optional delay
 ;
-; Two threads:
+; Three threads:
 ;   UI thread     - the dialog (chss.rc) and the tray icon. Never touches the network.
 ;   worker thread - connects to OBS, watches the file and switches scenes, so a slow
 ;                   or unreachable OBS never freezes the window.
+;   request thread - while the Requests page is on screen, reads the song request
+;                   queue from Ouvert (ouvert.dev), so a slow connection there can't
+;                   delay scene switching. Also runs Next song and the Twitch sign-in.
 ; They share settings and status text under g_cs. The UI posts requests by setting
 ; g_want/g_reconnect and signalling g_hEvent; the worker reports back with
 ; WM_APP_STATUS / WM_APP_SCENES.
@@ -68,6 +71,14 @@ IMP Shell_NotifyIconA
 IMP GetOpenFileNameA
 IMP InitCommonControls
 IMP GetDlgItem
+IMP MoveWindow
+IMP EnableWindow
+IMP ShellExecuteA
+IMP WinHttpQueryHeaders
+IMP Sleep
+IMP GetClientRect
+IMP GetWindowRect
+IMP MapWindowPoints
 IMP GetDlgCtrlID
 IMP MapDialogRect
 IMP FillRect
@@ -90,8 +101,14 @@ IMP WinHttpWebSocketSend
 IMP WinHttpWebSocketReceive
 IMP WinHttpWebSocketQueryCloseStatus
 IMP WinHttpCloseHandle
+IMP WinHttpReadData
+IMP IsWindowVisible
 IMP BCryptHash
 IMP CryptBinaryToStringA
+IMP CryptStringToBinaryA
+IMP CryptProtectData
+IMP CryptUnprotectData
+IMP LocalFree
 
 CS_ENTER macro
     lea rcx, g_cs
@@ -106,7 +123,12 @@ endm
 RBUF_SIZE   equ 262144
 TEXTSIZE    equ 4096
 MAXSCENES   equ 256
-NSET        equ 10
+NSET        equ 17
+REQ_POLL_MS equ 5000
+REQ_MAX     equ 100             ; requests shown
+RESP_SIZE   equ 131072
+PAGE_REQUESTS equ 0
+PAGE_SETTINGS equ 3
 POLL_MS     equ 250
 RETRY_MS    equ 5000
 
@@ -127,6 +149,8 @@ IDC_ACTIVE  equ 114
 IDC_DOT     equ 115
 IDC_STATUS  equ 116
 IDC_DIVIDER equ 117
+IDC_OUVERT  equ 118
+IDC_REQLIST equ 119
 IDL_HOST    equ 120             ; page labels
 IDL_PORT    equ 121
 IDL_PASS    equ 122
@@ -134,6 +158,15 @@ IDL_SONG    equ 123
 IDL_MENU    equ 124
 IDL_FILE    equ 125
 IDL_DELAY   equ 126
+IDL_OUVERT  equ 127
+IDC_OUVERTP equ 128
+IDL_OUVERTP equ 129
+IDC_NEXT    equ 130
+IDC_NEXTMSG equ 131
+IDC_TWSTAT  equ 132
+IDC_TWBTN   equ 133
+IDL_CHATCMD equ 134
+IDC_CHATCMD equ 135
 ID_SHOW     equ 200
 ID_EXIT     equ 201
 
@@ -149,6 +182,22 @@ CLR_DOTOFF  equ 00707070h       ; status dot: not connected
 CLR_DOTOK   equ 006EC24Ch       ;   connected
 CLR_DOTERR  equ 004B53E5h       ;   can't connect
 WM_APP_SCENES equ 8001h
+WM_APP_REQS   equ 8002h
+WM_APP_NEXTDONE equ 8003h
+WM_APP_TWITCH equ 8004h
+
+; build with /DCHSS_TEST to read requests from a local test server over plain HTTP
+ifdef CHSS_TEST
+OUVERT_PORT  equ 4467
+OUVERT_FLAGS equ 0
+TWITCH_PORT  equ 4468
+TWITCH_FLAGS equ 0
+else
+OUVERT_PORT  equ 443
+OUVERT_FLAGS equ 800000h        ; WINHTTP_FLAG_SECURE
+TWITCH_PORT  equ 443
+TWITCH_FLAGS equ 800000h
+endif
 WM_APP_TRAY   equ 800Ah
 
 ; ---------------------------------------------------------------------------
@@ -177,6 +226,14 @@ k_file      db 'song_file',0
 k_mpsong    db 'mp_song_scene',0
 k_mpmenu    db 'mp_menu_scene',0
 k_mode      db 'mode',0
+k_ouvert    db 'ouvert_key',0
+k_ouvertp   db 'ouvert_private_key',0
+k_twaccess  db 'twitch_access_token',0
+k_twrefresh db 'twitch_refresh_token',0
+k_twid      db 'twitch_user_id',0
+k_twlogin   db 'twitch_login',0
+k_chatcmd   db 'next_chat_command',0
+d_chatcmd   db '!playnext',0
 d_host      db 'localhost',0
 d_port      db '4455',0
 d_delay     db '0',0
@@ -227,6 +284,26 @@ s_noscenes  db "OBS didn't send its scene list",0
 w_agent     dw 'c','h','s','s',0
 w_get       dw 'G','E','T',0
 w_slash     dw '/',0
+ifdef CHSS_TEST
+w_ohost     dw '1','2','7','.','0','.','0','.','1',0
+else
+w_ohost     dw 'o','u','v','e','r','t','.','d','e','v',0
+endif
+w_opath     dw '/','A','P','I','/','S','o','n','g','R','e','q','u','e','s','t','s',0
+ifdef CHSS_TEST
+w_twid      dw '1','2','7','.','0','.','0','.','1',0
+w_twapi     dw '1','2','7','.','0','.','0','.','1',0
+else
+w_twid      dw 'i','d','.','t','w','i','t','c','h','.','t','v',0
+w_twapi     dw 'a','p','i','.','t','w','i','t','c','h','.','t','v',0
+endif
+w_post      dw 'P','O','S','T',0
+w_pdevice   dw '/','o','a','u','t','h','2','/','d','e','v','i','c','e',0
+w_ptoken    dw '/','o','a','u','t','h','2','/','t','o','k','e','n',0
+w_prevoke   dw '/','o','a','u','t','h','2','/','r','e','v','o','k','e',0
+w_pusers    dw '/','h','e','l','i','x','/','u','s','e','r','s',0
+w_pchat     dw '/','h','e','l','i','x','/','c','h','a','t','/','m','e','s','s','a','g','e','s',0
+w_onext     dw '/','A','P','I','/','S','o','n','g','R','e','q','u','e','s','t','s','/','N','e','x','t',0
 
 s_title     db 'CH Scene Switcher',0
 s_show      db 'Show',0
@@ -234,8 +311,73 @@ s_exit      db 'Exit',0
 s_noneitem  db '(none)',0
 s_sp        db 'Singleplayer',0
 s_mp        db 'Multiplayer',0
-s_navconn   db 'Connection',0
-s_navfile   db 'Song file',0
+s_navset    db 'Settings',0
+s_navreq    db 'Requests',0
+s_keyhdr    db 'X-API-KEY: ',0
+s_rstatus   db '"status":true',0
+s_rdata     db '"data":[',0
+s_rreq      db '"request":"',0
+s_rname     db '"requester_name":"',0
+s_rlen      db '"length":',0
+s_rsep      db '   -   ',0
+s_ropen     db '   (',0
+s_rnokey    db 'Enter your Ouvert public API key on the Settings page.',0
+s_rempty    db 'The queue is empty.',0
+s_rbad      db "Ouvert didn't accept that key, or sent something unexpected.",0
+s_rneterr   db "Can't reach Ouvert (error ",0
+s_rretry    db '). Retrying...',0
+s_rmsg      db '"message":"',0
+s_nnokey    db 'Enter your private API key on the Settings page.',0
+s_nok       db 'Moved to the next song.',0
+s_nbad      db 'Ouvert refused that.',0
+; The app's public Twitch Client ID (not a secret): dev.twitch.tv/console
+ifdef CHSS_TEST
+s_twclient  db 'testclient',0
+else
+s_twclient  db '0f04ohpjdjce8fktpx6wjnsx05g5sh',0
+endif
+s_open      db 'open',0
+s_secprefix db 22h,'dpapi:',0
+s_twurl     db 'https://www.twitch.tv/',0
+s_hform     db 'Content-Type: application/x-www-form-urlencoded',0
+s_hbearer   db 'Authorization: Bearer ',0
+s_hclient   db 13,10,'Client-Id: ',0
+s_hjson     db 13,10,'Content-Type: application/json',0
+s_fclient   db 'client_id=',0
+s_fscopes   db '&scopes=user%3Awrite%3Achat',0
+s_fdevice   db '&device_code=',0
+s_fgrant    db '&grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code',0
+s_frefresh  db 'grant_type=refresh_token&refresh_token=',0
+s_ftoken    db '&token=',0
+s_fclient2  db '&client_id=',0
+s_jdevice   db '"device_code"',0
+s_jucode    db '"user_code"',0
+s_jverif    db '"verification_uri"',0
+s_jinterval db '"interval"',0
+s_jexpires  db '"expires_in"',0
+s_jaccess   db '"access_token"',0
+s_jrefresh  db '"refresh_token"',0
+s_jid       db '"id"',0
+s_jlogin    db '"login"',0
+s_jmessage  db '"message"',0
+s_jpending  db 'authorization_pending',0
+s_jsent     db '"is_sent"',0
+s_cbroad    db '{"broadcaster_id":"',0
+s_csender   db '","sender_id":"',0
+s_cmessage  db '","message":"',0
+s_cend      db '"}',0
+s_twbsignin db 'Sign in to Twitch',0
+s_twbcancel db 'Cancel',0
+s_twbsignout db 'Sign out',0
+s_twoff     db 'Twitch: not signed in',0
+s_twas      db 'Twitch: signed in as ',0
+s_twcode1   db 'Twitch code: ',0
+s_twfail    db 'Twitch sign-in failed. Try again.',0
+s_twexpired db 'Twitch sign-in expired. Sign in again on Settings.',0
+s_twnocmd   db 'Set a chat command on the Settings page.',0
+s_twsent1   db 'Sent ',0
+s_twsent2   db ' to chat',0
+s_twsenderr db "Couldn't send to Twitch (error ",0
 s_dot       db 0E2h, 97h, 8Fh, 0        ; U+25CF black circle
 s_notconn   db 'Not connected',0
 s_connecting db 'Connecting...',0
@@ -272,24 +414,45 @@ settings_tbl dq k_host,  g_host,  256,  d_host
              dq k_mpsong, g_mpsong, 512, s_empty
              dq k_mpmenu, g_mpmenu, 512, s_empty
              dq k_mode,  g_modestr, 4,  d_delay      ; "0" = singleplayer, "1" = multiplayer
+; the next 4 rows are secrets: encrypted in the file (see secret_encode)
+settings_secret label qword
+             dq k_ouvert, g_ouvert, 128, s_empty
+             dq k_ouvertp, g_ouvertp, 128, s_empty
+             dq k_twaccess, g_twaccess, 256, s_empty
+             dq k_twrefresh, g_twrefresh, 256, s_empty
+             dq k_twid, g_twid, 32, s_empty
+             dq k_twlogin, g_twlogin, 64, s_empty
+             dq k_chatcmd, g_chatcmd, 64, d_chatcmd
 ; settings.json patterns, in settings_tbl order (ending in " = string value, else number)
 mig_tbl      dq m_host, m_port, m_pass, m_song, m_menu, m_delay, m_file, 0
 sfx_tbl      dq sfx1, sfx2, sfx3, 0
+; what each control does when the window resizes: 1 = move with the right edge,
+; 2 = move with the bottom edge, 4 = widen with the window, 8 = grow taller with it
+layout_tbl   dw IDC_NAV, 8, IDC_DIVIDER, 8, IDC_REQLIST, 12, IDC_NEXT, 2, IDC_NEXTMSG, 6
+             dw IDL_HOST, 4, IDC_HOST, 4, IDL_PORT, 1, IDC_PORT, 1, IDC_PASS, 4, IDL_PASS, 4
+             dw IDC_CONNECT, 1, IDC_CONN, 4, IDL_OUVERT, 4, IDC_OUVERT, 4, IDL_OUVERTP, 4, IDC_OUVERTP, 4
+             dw IDL_FILE, 4, IDC_FILE, 4, IDC_BROWSE, 1, IDC_DELAY, 1
+             dw IDL_SONG, 4, IDC_SONG, 4, IDL_MENU, 4, IDC_MENU, 4
+             dw IDC_TWSTAT, 4, IDC_TWBTN, 1, IDC_CHATCMD, 1
+             dw IDC_DOT, 2, IDC_STATUS, 6, IDC_USEMODE, 3, IDC_ACTIVE, 3, 0
 ; brushes made in main, in g_hBgBrush order
 brush_clr    dd CLR_BG, CLR_FIELD, CLR_SELBG, CLR_DIVIDER
 ; controls drawn with Windows' dark styles: 0 = DarkMode_CFD (fields), 1 = DarkMode_Explorer (buttons)
 theme_tbl    dw IDC_HOST, 0, IDC_PORT, 0, IDC_PASS, 0, IDC_FILE, 0, IDC_DELAY, 0
-             dw IDC_SONG, 0, IDC_MENU, 0, IDC_CONNECT, 1, IDC_BROWSE, 1, IDC_USEMODE, 1, 0
+             dw IDC_SONG, 0, IDC_MENU, 0, IDC_OUVERT, 0, IDC_OUVERTP, 0, IDC_REQLIST, 1, IDC_NEXT, 1, IDC_TWBTN, 1, IDC_CHATCMD, 0, IDC_CONNECT, 1, IDC_BROWSE, 1, IDC_USEMODE, 1, 0
 w_darkcfd    dw 'D','a','r','k','M','o','d','e','_','C','F','D',0
 w_darkexp    dw 'D','a','r','k','M','o','d','e','_','E','x','p','l','o','r','e','r',0
-g_one        dd 1
-; control, pages it shows on: bit 0 Connection, 1 Singleplayer, 2 Multiplayer,
-; 3 General; 80h = "Use this mode" and 40h = "This mode is active" (see show_page)
-page_tbl     dw IDL_HOST, 1, IDC_HOST, 1, IDL_PORT, 1, IDC_PORT, 1
-             dw IDL_PASS, 1, IDC_PASS, 1, IDC_CONNECT, 1, IDC_CONN, 1
-             dw IDL_SONG, 6, IDC_SONG, 6, IDL_MENU, 6, IDC_MENU, 6
+align 4
+g_one        dd 1                ; Windows rejects a misaligned value
+; control, pages it shows on: bit 0 Requests, 1 Singleplayer, 2 Multiplayer,
+; 3 Settings; 80h = "Use this mode" and 40h = "This mode is active" (see show_page)
+page_tbl     dw IDL_HOST, 8, IDC_HOST, 8, IDL_PORT, 8, IDC_PORT, 8
+             dw IDL_PASS, 8, IDC_PASS, 8, IDC_CONNECT, 8, IDC_CONN, 8
+             dw IDL_OUVERT, 8, IDC_OUVERT, 8, IDL_OUVERTP, 8, IDC_OUVERTP, 8
              dw IDL_FILE, 8, IDC_FILE, 8, IDC_BROWSE, 8
-             dw IDL_DELAY, 8, IDC_DELAY, 8
+             dw IDL_DELAY, 8, IDC_DELAY, 8, IDC_TWSTAT, 8, IDC_TWBTN, 8, IDL_CHATCMD, 8, IDC_CHATCMD, 8
+             dw IDL_SONG, 6, IDC_SONG, 6, IDL_MENU, 6, IDC_MENU, 6
+             dw IDC_REQLIST, 1, IDC_NEXT, 1, IDC_NEXTMSG, 1
              dw IDC_USEMODE, 80h, IDC_ACTIVE, 40h, 0
 
 ; ---------------------------------------------------------------------------
@@ -299,6 +462,16 @@ align 8
 g_hInst     dq ?
 g_hDlg      dq ?
 g_hEvent    dq ?
+g_hReqEvent dq ?            ; wakes the request thread
+r_hSession  dq ?            ; request thread's WinHTTP session
+r_path      dq ?            ; http_req: address asked for
+r_host      dq ?            ;   server (UTF-16)
+r_verb      dq ?            ;   GET or POST
+r_body      dq ?            ;   body, or 0
+g_blobin    dq 2 dup(?)     ; DATA_BLOB
+g_blobout   dq 2 dup(?)
+r_twdue     dq ?            ; when to next ask Twitch if sign-in finished
+r_twend     dq ?            ; when the sign-in code expires
 g_hSession  dq ?
 g_hConnect  dq ?
 g_hWs       dq ?
@@ -311,13 +484,34 @@ g_tmpptrs   dq MAXSCENES dup(?)
 g_ofn       dq 19 dup(?)    ; OPENFILENAMEA (152 bytes)
 g_nid       dq 66 dup(?)    ; NOTIFYICONDATAA (528 bytes)
 g_pt        dq ?
+g_reqnext   dd ?            ; set by the UI when Next song is clicked
+g_nextbusy  dd ?            ; waiting for Ouvert's answer (UI thread)
+g_twaction  dd ?            ; set by the UI: 1 sign in, 2 sign out, 3 cancel
+g_cchui     dd ?
+g_resave    dd ?            ; a secret was in plain text: save it encrypted
+g_twstate   dd ?            ; 0 signed out, 1 signing in, 2 signed in
+r_port      dd ?            ; http_req: port
+r_flags     dd ?            ;   WinHTTP flags
+r_status    dd ?            ;   HTTP status of the answer
+r_stlen     dd ?
+r_interval  dd ?            ; ms between sign-in checks
+r_chatsent  dd ?
+r_read      dd ?
+r_err       dd ?
+r_secs      dd ?
 g_mode      dd ?            ; active mode: 0 = singleplayer, 1 = multiplayer
 g_view      dd ?            ; mode whose page is shown (UI thread)
-g_page      dd ?            ; 0 Connection, 1 Singleplayer, 2 Multiplayer, 3 General
+g_page      dd ?            ; 0 Requests, 1 Singleplayer, 2 Multiplayer, 3 Settings
 g_modechg   dd ?            ; set by the UI when the active mode changes
 g_connstate dd ?            ; 0 not connected, 1 connecting, 2 connected, 3 can't connect
+g_cw0       dd ?            ; client size the controls were laid out for
+g_ch0       dd ?
+g_minw      dd ?            ; smallest window size
+g_minh      dd ?
+g_laydone   dd ?
 g_navpad    dd ?            ; page list text inset, in pixels
 g_rc        dd 4 dup(?)     ; RECT
+g_lay       dq 5*32 dup(?)  ; per layout_tbl entry: control, then x, y, width, height (dwords)
 g_hBgBrush  dq ?            ; brushes, in brush_clr order
 g_hFieldBrush dq ?
 g_hSelBrush dq ?
@@ -333,7 +527,6 @@ g_nscenes   dd ?
 g_closecode dw ?
 g_whost     dw 256 dup(?)
 g_wtmp      dw 1024 dup(?)
-g_digits    db 24 dup(?)
 ; settings (written by the UI thread under g_cs)
 g_host      db 256 dup(?)
 g_port      db 16 dup(?)
@@ -378,6 +571,34 @@ g_reason    db 128 dup(?)
 g_text      db TEXTSIZE dup(?)
 g_last      db TEXTSIZE dup(?)
 g_sbuf      db 2048 dup(?)
+; Ouvert request queue
+g_ouvert    db 128 dup(?)   ; public API key (written by the UI thread under g_cs)
+g_ouvertp   db 128 dup(?)   ; private API key, used only for Next song
+g_twaccess  db 256 dup(?)   ; Twitch sign-in (under g_cs; never shown)
+g_twrefresh db 256 dup(?)
+g_twid      db 32 dup(?)
+g_twlogin   db 64 dup(?)
+g_chatcmd   db 64 dup(?)
+g_twstat    db 512 dup(?)
+g_nextmsg   db 512 dup(?)   ; result of Next song (under g_cs)
+r_nmsg      db 512 dup(?)
+g_reqtext   db 65536 dup(?) ; lines shown on the Requests page (under g_cs)
+r_key       db 128 dup(?)   ; request thread's scratch
+r_hdr       db 1024 dup(?)
+r_whdr      dw 1024 dup(?)
+r_form      db 2048 dup(?)
+r_devcode   db 256 dup(?)
+r_usercode  db 64 dup(?)
+r_verif     db 512 dup(?)
+r_twaccess  db 256 dup(?)
+r_twrefresh db 256 dup(?)
+r_twid      db 32 dup(?)
+r_twlogin   db 64 dup(?)
+r_chatcmd   db 64 dup(?)
+r_title     db 400 dup(?)
+r_name      db 64 dup(?)
+r_list      db 65536 dup(?)
+r_buf       db RESP_SIZE dup(?)
 g_rbuf      db RBUF_SIZE dup(?)
 g_pool      db MAXSCENES*512 dup(?)
 
@@ -522,15 +743,13 @@ cj_e:
     ret
 copy_jstr ENDP
 
-; rcx = str: turn JSON escapes \x into x, in place
+; rcx = str: decode JSON escapes in place (\uXXXX becomes UTF-8, line breaks a space)
 unescape PROC
     mov rdx, rcx
 ue_l:
     mov al, [rdx]
     cmp al, 5Ch
-    jne ue_put
-    inc rdx
-    mov al, [rdx]
+    je ue_esc
 ue_put:
     mov [rcx], al
     test al, al
@@ -538,9 +757,120 @@ ue_put:
     inc rcx
     inc rdx
     jmp ue_l
+ue_esc:
+    inc rdx
+    mov al, [rdx]
+    cmp al, 'u'
+    je ue_u
+    cmp al, 'n'
+    je ue_sp
+    cmp al, 'r'
+    je ue_sp
+    cmp al, 't'
+    jne ue_put
+ue_sp:
+    mov al, ' '
+    jmp ue_put
+ue_u:
+    inc rdx
+    call ue_hex4
+    cmp eax, 0D800h                 ; high surrogate: combine with the \u that follows
+    jb ue_enc
+    cmp eax, 0DBFFh
+    ja ue_enc
+    cmp word ptr [rdx], 755Ch       ; "\u"
+    jne ue_enc
+    mov r8d, eax
+    add rdx, 2
+    call ue_hex4
+    sub eax, 0DC00h
+    and eax, 3FFh
+    sub r8d, 0D800h
+    shl r8d, 10
+    lea eax, [rax+r8+10000h]
+ue_enc:
+    cmp eax, 20h                    ; control characters become a space
+    jae ue_e1
+    mov eax, ' '
+ue_e1:
+    cmp eax, 80h
+    jae ue_e2
+    mov [rcx], al
+    inc rcx
+    jmp ue_l
+ue_e2:
+    cmp eax, 800h
+    jae ue_e3
+    mov r8d, eax
+    shr r8d, 6
+    or r8b, 0C0h
+    mov [rcx], r8b
+    inc rcx
+    jmp ue_last
+ue_e3:
+    cmp eax, 10000h
+    jae ue_e4
+    mov r8d, eax
+    shr r8d, 12
+    or r8b, 0E0h
+    mov [rcx], r8b
+    inc rcx
+    jmp ue_mid
+ue_e4:
+    mov r8d, eax
+    shr r8d, 18
+    or r8b, 0F0h
+    mov [rcx], r8b
+    inc rcx
+    mov r8d, eax
+    shr r8d, 12
+    and r8b, 3Fh
+    or r8b, 80h
+    mov [rcx], r8b
+    inc rcx
+ue_mid:
+    mov r8d, eax
+    shr r8d, 6
+    and r8b, 3Fh
+    or r8b, 80h
+    mov [rcx], r8b
+    inc rcx
+ue_last:
+    and al, 3Fh
+    or al, 80h
+    mov [rcx], al
+    inc rcx
+    jmp ue_l
 ue_e:
     ret
 unescape ENDP
+
+; rdx = four hex digits -> eax = value, rdx moved past them; '?' if they aren't hex
+ue_hex4 PROC
+    xor eax, eax
+    mov r9d, 4
+uh_l:
+    movzx r10d, byte ptr [rdx]
+    sub r10d, '0'
+    cmp r10d, 9
+    jbe uh_add
+    movzx r10d, byte ptr [rdx]
+    or r10d, 20h
+    sub r10d, 'a'
+    cmp r10d, 5
+    ja uh_bad
+    add r10d, 10
+uh_add:
+    shl eax, 4
+    or eax, r10d
+    inc rdx
+    dec r9d
+    jnz uh_l
+    ret
+uh_bad:
+    mov eax, '?'
+    ret
+ue_hex4 ENDP
 
 ; rcx = dst, rdx = src: copy, escaping " and \ for JSON -> rax = dst's terminating zero
 json_escape PROC
@@ -660,24 +990,30 @@ fl_z:
     ret
 first_line ENDP
 
-; rcx = value, rdx = dst -> rax = pointer to dst's terminating zero (worker thread only)
+; rcx = value, rdx = dst -> rax = pointer to dst's terminating zero
 utoa PROC
-    mov rax, rcx
     mov r8, rdx
-    lea r9, g_digits+23
-    mov byte ptr [r9], 0
+    mov rax, rcx
     mov r10, 10
-ut_l:
+ut_n:
+    inc r8
+    xor edx, edx
+    div r10
+    test rax, rax
+    jnz ut_n
+    mov byte ptr [r8], 0
+    mov r9, r8
+    mov rax, rcx
+ut_w:
     xor edx, edx
     div r10
     add dl, '0'
-    dec r9
-    mov [r9], dl
+    dec r8
+    mov [r8], dl
     test rax, rax
-    jnz ut_l
-    mov rcx, r8
-    mov rdx, r9
-    jmp stpcpy
+    jnz ut_w
+    mov rax, r9
+    ret
 utoa ENDP
 
 ; rcx = str -> rax = unsigned value, or -1 if empty/invalid/over 32 bits
@@ -873,6 +1209,136 @@ init_paths PROC
     ret
 init_paths ENDP
 
+; rcx = secret: writes "dpapi:<base64>" to g_uitmp2, encrypted with Windows DPAPI so only
+; this Windows user can read it. If that fails it writes "", never the plain text.
+secret_encode PROC
+    push rbx
+    sub rsp, 40h
+    mov rbx, rcx
+    call strlen
+    mov dword ptr g_blobin, eax
+    mov qword ptr g_blobin+8, rbx
+    lea rcx, g_blobin
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
+    and qword ptr [rsp+20h], 0
+    mov qword ptr [rsp+28h], 1      ; CRYPTPROTECT_UI_FORBIDDEN
+    lea rax, g_blobout
+    mov [rsp+30h], rax
+    call [__imp_CryptProtectData]
+    test eax, eax
+    jz se2_empty
+    lea rcx, g_uitmp2
+    lea rdx, s_secprefix
+    call stpcpy
+    mov rbx, rax
+    mov g_cchui, 1900
+    lea rax, g_cchui
+    mov [rsp+20h], rax
+    mov rcx, qword ptr g_blobout+8
+    mov edx, dword ptr g_blobout
+    mov r8d, 40000001h              ; CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF
+    mov r9, rbx
+    call [__imp_CryptBinaryToStringA]
+    mov rcx, qword ptr g_blobout+8
+    mov rbx, rax                    ; result
+    call [__imp_LocalFree]
+    test rbx, rbx
+    jz se2_empty
+    lea rcx, g_uitmp2
+    call strlen
+    lea rcx, g_uitmp2
+    mov word ptr [rcx+rax], 0022h
+    jmp se2_ret
+se2_empty:
+    lea rcx, g_uitmp2
+    mov word ptr [rcx], 2222h
+    mov byte ptr [rcx+2], 0
+se2_ret:
+    add rsp, 40h
+    pop rbx
+    ret
+secret_encode ENDP
+
+; rcx = dst, edx = dst size: g_uitmp2 holds the saved value. Decrypts "dpapi:..."; plain
+; text from an older version is kept and flagged to be saved encrypted. dst ends up
+; empty if it can't be decrypted (another PC or Windows user).
+secret_decode PROC
+    push rbx
+    push rsi
+    sub rsp, 48h
+    mov rbx, rcx
+    mov esi, edx
+    mov byte ptr [rbx], 0
+    cmp dword ptr g_uitmp2, 70617064h   ; "dpap"
+    jne sd_plain
+    cmp word ptr g_uitmp2+4, 3A69h      ; "i:"
+    jne sd_plain
+    mov g_cchui, 1024
+    lea rcx, g_uitmp2+6
+    xor edx, edx                    ; zero-terminated
+    mov r8d, 1                      ; CRYPT_STRING_BASE64
+    lea r9, g_uitmp
+    lea rax, g_cchui
+    mov [rsp+20h], rax
+    and qword ptr [rsp+28h], 0
+    and qword ptr [rsp+30h], 0
+    call [__imp_CryptStringToBinaryA]
+    test eax, eax
+    jz sd_ret
+    mov eax, g_cchui
+    mov dword ptr g_blobin, eax
+    lea rax, g_uitmp
+    mov qword ptr g_blobin+8, rax
+    lea rcx, g_blobin
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
+    and qword ptr [rsp+20h], 0
+    mov qword ptr [rsp+28h], 1      ; CRYPTPROTECT_UI_FORBIDDEN
+    lea rax, g_blobout
+    mov [rsp+30h], rax
+    call [__imp_CryptUnprotectData]
+    test eax, eax
+    jz sd_ret
+    mov ecx, dword ptr g_blobout
+    lea eax, [rsi-1]
+    cmp ecx, eax
+    jbe sd_len
+    mov ecx, eax
+sd_len:
+    mov rdx, qword ptr g_blobout+8
+    mov r8, rbx
+sd_c:
+    test ecx, ecx
+    jz sd_end
+    mov al, [rdx]
+    mov [r8], al
+    inc rdx
+    inc r8
+    dec ecx
+    jmp sd_c
+sd_end:
+    mov byte ptr [r8], 0
+    mov rcx, qword ptr g_blobout+8
+    call [__imp_LocalFree]
+    jmp sd_ret
+sd_plain:
+    cmp byte ptr g_uitmp2, 0
+    je sd_ret
+    mov g_resave, 1
+    mov rcx, rbx
+    lea rdx, g_uitmp2
+    mov r8d, esi
+    call strncpy0
+sd_ret:
+    add rsp, 48h
+    pop rsi
+    pop rbx
+    ret
+secret_decode ENDP
+
 load_settings PROC
     push rbx
     push rsi
@@ -885,10 +1351,28 @@ ls_l:
     mov r8, [rbx+24]
     mov r9, [rbx+8]
     mov rax, [rbx+16]
+    lea rcx, settings_secret
+    mov r10, rbx
+    sub r10, rcx
+    lea rcx, s_section
+    cmp r10, 4*32
+    jae ls_read
+    lea r9, g_uitmp2                ; a secret: read it here, then decrypt it
+    mov eax, 2048
+ls_read:
     mov [rsp+20h], rax
     lea rax, g_ini
     mov [rsp+28h], rax
     call [__imp_GetPrivateProfileStringA]
+    lea rcx, settings_secret
+    mov rax, rbx
+    sub rax, rcx
+    cmp rax, 4*32
+    jae ls_next
+    mov rcx, [rbx+8]
+    mov edx, [rbx+16]
+    call secret_decode
+ls_next:
     add rbx, 32
     dec esi
     jnz ls_l
@@ -898,11 +1382,11 @@ ls_l:
     ret
 load_settings ENDP
 
-; UI thread only (it is the only writer of the settings)
 save_settings PROC
     push rbx
     push rsi
     sub rsp, 28h
+    CS_ENTER                        ; the request thread updates the Twitch sign-in
     lea rcx, g_dir
     xor edx, edx
     call [__imp_CreateDirectoryA]
@@ -916,6 +1400,16 @@ sv_l:
     mov rdx, [rbx+8]
     call stpcpy
     mov word ptr [rax], 0022h
+    lea rcx, settings_secret
+    mov rax, rbx
+    sub rax, rcx
+    cmp rax, 4*32
+    jae sv_write
+    mov rcx, [rbx+8]
+    cmp byte ptr [rcx], 0
+    je sv_write
+    call secret_encode
+sv_write:
     lea rcx, s_section
     mov rdx, [rbx]
     lea r8, g_uitmp2
@@ -924,6 +1418,7 @@ sv_l:
     add rbx, 32
     dec esi
     jnz sv_l
+    CS_LEAVE
     add rsp, 28h
     pop rsi
     pop rbx
@@ -1931,6 +2426,1250 @@ wk_result:
     jmp wk_loop
 worker ENDP
 
+; ---- request thread ------------------------------------------------------------
+
+; Sends the request described by r_host, r_port, r_flags, r_verb, r_path, r_hdr and
+; r_body. The answer goes in r_buf and its status in r_status -> eax = 1, or 0 with r_err
+http_req PROC
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    sub rsp, 48h
+    xor ebx, ebx                    ; connection
+    xor esi, esi                    ; request
+    xor r12d, r12d                  ; result
+    cmp r_hSession, 0
+    jne rq_sess
+    lea rcx, w_agent
+    mov edx, 4                      ; WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+    xor r8d, r8d
+    xor r9d, r9d
+    and qword ptr [rsp+20h], 0
+    call [__imp_WinHttpOpen]
+    mov r_hSession, rax
+    test rax, rax
+    jz rq_err
+    mov rcx, rax
+    mov edx, 5000
+    mov r8d, 5000
+    mov r9d, 5000
+    mov qword ptr [rsp+20h], 5000
+    call [__imp_WinHttpSetTimeouts]
+rq_sess:
+    mov rcx, r_hSession
+    mov rdx, r_host
+    mov r8d, r_port
+    xor r9d, r9d
+    call [__imp_WinHttpConnect]
+    mov rbx, rax
+    test rax, rax
+    jz rq_err
+    mov rcx, rbx
+    mov rdx, r_verb
+    mov r8, r_path
+    xor r9d, r9d
+    and qword ptr [rsp+20h], 0
+    and qword ptr [rsp+28h], 0
+    mov eax, r_flags
+    mov [rsp+30h], rax
+    call [__imp_WinHttpOpenRequest]
+    mov rsi, rax
+    test rax, rax
+    jz rq_err
+    mov ecx, 65001
+    xor edx, edx
+    lea r8, r_hdr
+    mov r9d, -1
+    lea rax, r_whdr
+    mov [rsp+20h], rax
+    mov qword ptr [rsp+28h], 1024
+    call [__imp_MultiByteToWideChar]
+    xor eax, eax
+    mov rcx, r_body
+    test rcx, rcx
+    jz rq_len
+    call strlen
+rq_len:
+    mov [rsp+20h], rax
+    mov [rsp+28h], rax
+    and qword ptr [rsp+30h], 0
+    mov rcx, rsi
+    lea rdx, r_whdr
+    mov r8d, -1
+    mov r9, r_body
+    call [__imp_WinHttpSendRequest]
+    test eax, eax
+    jz rq_err
+    mov rcx, rsi
+    xor edx, edx
+    call [__imp_WinHttpReceiveResponse]
+    test eax, eax
+    jz rq_err
+    mov r_status, 0
+    mov r_stlen, 4
+    mov rcx, rsi
+    mov edx, 20000013h              ; WINHTTP_QUERY_STATUS_CODE | FLAG_NUMBER
+    xor r8d, r8d
+    lea r9, r_status
+    lea rax, r_stlen
+    mov [rsp+20h], rax
+    and qword ptr [rsp+28h], 0
+    call [__imp_WinHttpQueryHeaders]
+    xor edi, edi                    ; bytes so far
+rq_read:
+    mov r8d, RESP_SIZE-1
+    sub r8d, edi
+    jz rq_done
+    mov rcx, rsi
+    lea rdx, r_buf
+    add rdx, rdi
+    lea r9, r_read
+    call [__imp_WinHttpReadData]
+    test eax, eax
+    jz rq_err
+    cmp r_read, 0
+    je rq_done
+    add edi, r_read
+    jmp rq_read
+rq_done:
+    lea rcx, r_buf
+    mov byte ptr [rcx+rdi], 0
+    mov r12d, 1
+    jmp rq_close
+rq_err:
+    call [__imp_GetLastError]
+    mov r_err, eax
+rq_close:
+    test rsi, rsi
+    jz rq_c1
+    mov rcx, rsi
+    call [__imp_WinHttpCloseHandle]
+rq_c1:
+    test rbx, rbx
+    jz rq_c2
+    mov rcx, rbx
+    call [__imp_WinHttpCloseHandle]
+rq_c2:
+    mov eax, r12d
+    add rsp, 48h
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+http_req ENDP
+
+; GET r_path from Ouvert with the key in r_key -> eax = 1, or 0 with r_err
+req_fetch PROC
+    sub rsp, 28h
+    lea rax, w_ohost
+    mov r_host, rax
+    mov r_port, OUVERT_PORT
+    mov r_flags, OUVERT_FLAGS
+    lea rax, w_get
+    mov r_verb, rax
+    mov r_body, 0
+    lea rcx, r_hdr
+    lea rdx, s_keyhdr
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_key
+    call stpcpy
+    call http_req
+    add rsp, 28h
+    ret
+req_fetch ENDP
+
+; rcx = '{' -> rax = its matching '}', or 0 if the text ends first (leaf)
+obj_end PROC
+    xor edx, edx                    ; depth
+    xor r8d, r8d                    ; inside a string
+oe_l:
+    mov al, [rcx]
+    test al, al
+    jz oe_none
+    test r8d, r8d
+    jz oe_out
+    cmp al, 5Ch
+    jne oe_q
+    inc rcx                         ; skip the escaped character
+    cmp byte ptr [rcx], 0
+    je oe_none
+    jmp oe_next
+oe_q:
+    cmp al, 22h
+    jne oe_next
+    xor r8d, r8d
+    jmp oe_next
+oe_out:
+    cmp al, 22h
+    jne oe_o1
+    mov r8d, 1
+    jmp oe_next
+oe_o1:
+    cmp al, '{'
+    jne oe_o2
+    inc edx
+    jmp oe_next
+oe_o2:
+    cmp al, '}'
+    jne oe_next
+    dec edx
+    jz oe_found
+oe_next:
+    inc rcx
+    jmp oe_l
+oe_found:
+    mov rax, rcx
+    ret
+oe_none:
+    xor eax, eax
+    ret
+obj_end ENDP
+
+; Turns the response in r_buf into display lines in r_list -> eax = 0 if it isn't a queue
+req_parse PROC
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    sub rsp, 20h
+    lea rcx, r_buf
+    lea rdx, s_rstatus
+    call strfind
+    test rax, rax
+    jz rp_bad
+    lea rcx, r_buf
+    lea rdx, s_rdata
+    call strfind
+    test rax, rax
+    jz rp_bad
+    mov rsi, rax                    ; read position
+    lea rdi, r_list                 ; write position
+    mov byte ptr [rdi], 0
+    xor ebx, ebx                    ; requests so far
+rp_scan:
+    mov al, [rsi]
+    test al, al
+    jz rp_end
+    cmp al, ']'
+    je rp_end
+    cmp al, '{'
+    je rp_obj
+    inc rsi
+    jmp rp_scan
+rp_obj:
+    cmp ebx, REQ_MAX
+    jae rp_end
+    mov r12, rsi
+    mov rcx, rsi
+    call obj_end
+    test rax, rax
+    jz rp_end                       ; cut off: show what arrived
+    mov r13, rax
+    mov byte ptr [r13], 0           ; search this request only
+    mov byte ptr r_title, 0
+    mov byte ptr r_name, 0
+    mov rcx, r12
+    lea rdx, s_rreq
+    call strfind
+    test rax, rax
+    jz rp_noreq
+    mov rcx, rax
+    lea rdx, r_title
+    mov r8d, 400
+    call copy_jstr
+    lea rcx, r_title
+    call unescape
+rp_noreq:
+    mov rcx, r12
+    lea rdx, s_rname
+    call strfind
+    test rax, rax
+    jz rp_noname
+    mov rcx, rax
+    lea rdx, r_name
+    mov r8d, 64
+    call copy_jstr
+    lea rcx, r_name
+    call unescape
+rp_noname:
+    ; "1. Artist: Song   -   requester   (2:19)"
+    inc ebx
+    mov ecx, ebx
+    mov rdx, rdi
+    call utoa
+    mov word ptr [rax], 202Eh       ; ". "
+    lea rcx, [rax+2]
+    lea rdx, r_title
+    call stpcpy
+    mov rdi, rax
+    cmp byte ptr r_name, 0
+    je rp_len
+    mov rcx, rdi
+    lea rdx, s_rsep
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_name
+    call stpcpy
+    mov rdi, rax
+rp_len:
+    mov rcx, r12
+    lea rdx, s_rlen
+    call strfind
+    test rax, rax
+    jz rp_eol
+    cmp byte ptr [rax], 22h         ; a number or a quoted number
+    jne rp_digits
+    inc rax
+rp_digits:
+    xor ecx, ecx
+    xor r8d, r8d                    ; digits seen
+rp_dl:
+    movzx edx, byte ptr [rax]
+    sub edx, '0'
+    cmp edx, 9
+    ja rp_dd
+    cmp ecx, 1000000
+    jae rp_eol
+    imul ecx, ecx, 10
+    add ecx, edx
+    inc r8d
+    inc rax
+    jmp rp_dl
+rp_dd:
+    test r8d, r8d
+    jz rp_eol
+    mov eax, ecx
+    xor edx, edx
+    mov ecx, 60
+    div ecx
+    mov r_secs, edx
+    mov r12d, eax                   ; minutes
+    mov rcx, rdi
+    lea rdx, s_ropen
+    call stpcpy
+    mov rdx, rax
+    mov ecx, r12d
+    call utoa
+    mov byte ptr [rax], ':'
+    mov rdi, rax
+    inc rdi
+    mov eax, r_secs
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add al, '0'
+    add dl, '0'
+    mov [rdi], al
+    mov [rdi+1], dl
+    mov byte ptr [rdi+2], ')'
+    add rdi, 3
+rp_eol:
+    mov word ptr [rdi], 000Ah
+    inc rdi
+    lea rsi, [r13+1]
+    jmp rp_scan
+rp_end:
+    test ebx, ebx
+    jnz rp_ok
+    lea rcx, r_list
+    lea rdx, s_rempty
+    call stpcpy
+rp_ok:
+    mov eax, 1
+    jmp rp_ret
+rp_bad:
+    xor eax, eax
+rp_ret:
+    add rsp, 20h
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+req_parse ENDP
+
+; Hands r_list to the UI if it changed
+req_publish PROC
+    push rbx
+    sub rsp, 20h
+    CS_ENTER
+    lea rcx, r_list
+    lea rdx, g_reqtext
+    call streq
+    mov ebx, eax
+    test eax, eax
+    jnz rb_same
+    lea rcx, g_reqtext
+    lea rdx, r_list
+    call stpcpy
+rb_same:
+    CS_LEAVE
+    test ebx, ebx
+    jnz rb_ret
+    mov rcx, g_hDlg
+    mov edx, WM_APP_REQS
+    xor r8d, r8d
+    xor r9d, r9d
+    call [__imp_PostMessageA]
+rb_ret:
+    add rsp, 20h
+    pop rbx
+    ret
+req_publish ENDP
+
+; rcx = dst, rdx = src: copy, percent-encoding for a form body (leaf)
+; -> rax = dst's terminating zero
+url_enc PROC
+ug_l:
+    mov al, [rdx]
+    test al, al
+    jz ug_e
+    inc rdx
+    cmp al, '-'
+    je ug_put
+    cmp al, '_'
+    je ug_put
+    cmp al, '.'
+    je ug_put
+    cmp al, '~'
+    je ug_put
+    mov r8b, al
+    sub r8b, '0'
+    cmp r8b, 9
+    jbe ug_put
+    mov r8b, al
+    or r8b, 20h
+    sub r8b, 'a'
+    cmp r8b, 25
+    jbe ug_put
+    mov byte ptr [rcx], '%'
+    movzx r8d, al
+    shr r8d, 4
+    add r8b, '0'
+    cmp r8b, '9'
+    jbe ug_1
+    add r8b, 7
+ug_1:
+    mov [rcx+1], r8b
+    and al, 0Fh
+    add al, '0'
+    cmp al, '9'
+    jbe ug_2
+    add al, 7
+ug_2:
+    mov [rcx+2], al
+    add rcx, 3
+    jmp ug_l
+ug_put:
+    mov [rcx], al
+    inc rcx
+    jmp ug_l
+ug_e:
+    mov byte ptr [rcx], 0
+    mov rax, rcx
+    ret
+url_enc ENDP
+
+; rcx = key with its quotes -> rax = start of that key's value in r_buf, or 0
+json_val PROC
+    sub rsp, 28h
+    mov rdx, rcx
+    lea rcx, r_buf
+    call strfind
+    test rax, rax
+    jz jv_ret
+jv_ws:
+    mov cl, [rax]
+    cmp cl, ':'
+    je jv_next
+    cmp cl, ' '
+    je jv_next
+    cmp cl, 9
+    je jv_next
+    cmp cl, 13
+    je jv_next
+    cmp cl, 10
+    jne jv_ret
+jv_next:
+    inc rax
+    jmp jv_ws
+jv_ret:
+    add rsp, 28h
+    ret
+json_val ENDP
+
+; rcx = key with its quotes, rdx = dst, r8d = dst size: copies that string value
+; from r_buf -> eax = 1 if it was there and not empty
+json_copy PROC
+    push rbx
+    push rsi
+    sub rsp, 28h
+    mov rbx, rdx
+    mov esi, r8d
+    mov byte ptr [rbx], 0
+    call json_val
+    test rax, rax
+    jz jc_no
+    cmp byte ptr [rax], 22h
+    jne jc_no
+    lea rcx, [rax+1]
+    mov rdx, rbx
+    mov r8d, esi
+    call copy_jstr
+    mov rcx, rbx
+    call unescape
+    cmp byte ptr [rbx], 0
+    je jc_no
+    mov eax, 1
+    jmp jc_ret
+jc_no:
+    xor eax, eax
+jc_ret:
+    add rsp, 28h
+    pop rsi
+    pop rbx
+    ret
+json_copy ENDP
+
+; rcx = key with its quotes, edx = default -> eax = that number from r_buf
+json_num PROC
+    push rbx
+    sub rsp, 20h
+    mov ebx, edx
+    call json_val
+    test rax, rax
+    jz jn_def
+    xor ecx, ecx
+    xor r8d, r8d
+jn_l:
+    movzx edx, byte ptr [rax]
+    sub edx, '0'
+    cmp edx, 9
+    ja jn_end
+    cmp ecx, 100000000
+    jae jn_end
+    imul ecx, ecx, 10
+    add ecx, edx
+    inc r8d
+    inc rax
+    jmp jn_l
+jn_end:
+    test r8d, r8d
+    jz jn_def
+    mov ebx, ecx
+jn_def:
+    mov eax, ebx
+    add rsp, 20h
+    pop rbx
+    ret
+json_num ENDP
+
+; rcx = server, rdx = address, r8 = GET or POST, r9 = body or 0; headers already in r_hdr
+tw_call PROC
+    sub rsp, 28h
+    mov r_host, rcx
+    mov r_path, rdx
+    mov r_verb, r8
+    mov r_body, r9
+    mov r_port, TWITCH_PORT
+    mov r_flags, TWITCH_FLAGS
+    call http_req
+    lea rcx, w_opath                ; everything else talks to Ouvert
+    mov r_path, rcx
+    add rsp, 28h
+    ret
+tw_call ENDP
+
+; r_hdr = bearer token and Client ID, plus JSON type if ecx isn't 0
+tw_authhdr PROC
+    push rbx
+    sub rsp, 20h
+    mov ebx, ecx
+    lea rcx, r_hdr
+    lea rdx, s_hbearer
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_twaccess
+    call stpcpy
+    mov rcx, rax
+    lea rdx, s_hclient
+    call stpcpy
+    mov rcx, rax
+    lea rdx, s_twclient
+    call stpcpy
+    test ebx, ebx
+    jz ta_ret
+    mov rcx, rax
+    lea rdx, s_hjson
+    call stpcpy
+ta_ret:
+    add rsp, 20h
+    pop rbx
+    ret
+tw_authhdr ENDP
+
+; Copies the sign-in from the settings
+tw_load PROC
+    sub rsp, 28h
+    CS_ENTER
+    lea rcx, r_twaccess
+    lea rdx, g_twaccess
+    call stpcpy
+    lea rcx, r_twrefresh
+    lea rdx, g_twrefresh
+    call stpcpy
+    lea rcx, r_twid
+    lea rdx, g_twid
+    call stpcpy
+    lea rcx, r_twlogin
+    lea rdx, g_twlogin
+    call stpcpy
+    lea rcx, r_chatcmd
+    lea rdx, g_chatcmd
+    call stpcpy
+    CS_LEAVE
+    add rsp, 28h
+    ret
+tw_load ENDP
+
+; Stores the sign-in and tells the UI: ecx = new g_twstate, rdx = status text,
+; r8d = 1 to also open the sign-in page. The UI saves the settings.
+tw_store PROC
+    push rbx
+    push rsi
+    push rdi
+    sub rsp, 20h
+    mov ebx, ecx
+    mov rsi, rdx
+    mov edi, r8d
+    CS_ENTER
+    mov g_twstate, ebx
+    lea rcx, g_twaccess
+    lea rdx, r_twaccess
+    call stpcpy
+    lea rcx, g_twrefresh
+    lea rdx, r_twrefresh
+    call stpcpy
+    lea rcx, g_twid
+    lea rdx, r_twid
+    call stpcpy
+    lea rcx, g_twlogin
+    lea rdx, r_twlogin
+    call stpcpy
+    lea rcx, g_twstat
+    mov rdx, rsi
+    call stpcpy
+    CS_LEAVE
+    mov rcx, g_hDlg
+    mov edx, WM_APP_TWITCH
+    mov r8d, edi
+    xor r9d, r9d
+    call [__imp_PostMessageA]
+    add rsp, 20h
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+tw_store ENDP
+
+tw_clear PROC
+    mov byte ptr r_twaccess, 0
+    mov byte ptr r_twrefresh, 0
+    mov byte ptr r_twid, 0
+    mov byte ptr r_twlogin, 0
+    ret
+tw_clear ENDP
+
+; rcx = status text: back to signed out
+tw_fail PROC
+    push rbx
+    sub rsp, 20h
+    mov rbx, rcx
+    call tw_clear
+    xor ecx, ecx
+    mov rdx, rbx
+    xor r8d, r8d
+    call tw_store
+    add rsp, 20h
+    pop rbx
+    ret
+tw_fail ENDP
+
+; Sign in clicked: asks Twitch for a code, then opens the page to approve it
+tw_start PROC
+    sub rsp, 28h
+    call tw_clear
+    lea rcx, r_hdr
+    lea rdx, s_hform
+    call stpcpy
+    lea rcx, r_form
+    lea rdx, s_fclient
+    call stpcpy
+    mov rcx, rax
+    lea rdx, s_twclient
+    call url_enc
+    mov rcx, rax
+    lea rdx, s_fscopes
+    call stpcpy
+    lea rcx, w_twid
+    lea rdx, w_pdevice
+    lea r8, w_post
+    lea r9, r_form
+    call tw_call
+    test eax, eax
+    jz ts_fail
+    cmp r_status, 200
+    jne ts_fail
+    lea rcx, s_jdevice
+    lea rdx, r_devcode
+    mov r8d, 256
+    call json_copy
+    test eax, eax
+    jz ts_fail
+    lea rcx, s_jucode
+    lea rdx, r_usercode
+    mov r8d, 64
+    call json_copy
+    test eax, eax
+    jz ts_fail
+    lea rcx, s_jverif
+    lea rdx, r_verif
+    mov r8d, 512
+    call json_copy
+    test eax, eax
+    jz ts_fail
+    lea rcx, s_jinterval
+    mov edx, 5
+    call json_num
+    cmp eax, 5                      ; never faster than Twitch's documented 5 seconds
+    jae ts_int
+    mov eax, 5
+ts_int:
+    imul eax, eax, 1000
+    mov r_interval, eax
+    lea rcx, s_jexpires
+    mov edx, 1800
+    call json_num
+    imul eax, eax, 1000
+    mov r_twend, rax
+    call [__imp_GetTickCount64]
+    add r_twend, rax
+    mov ecx, r_interval
+    add rax, rcx
+    mov r_twdue, rax
+    lea rcx, r_nmsg
+    lea rdx, s_twcode1
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_usercode
+    call stpcpy
+    ; only ever open Twitch's own site
+    lea rcx, r_verif
+    lea rdx, s_twurl
+    call strfind
+    lea rcx, r_verif
+    add rcx, 22
+    xor r8d, r8d
+    cmp rax, rcx
+    jne ts_show
+    mov r8d, 1
+ts_show:
+    mov ecx, 1
+    lea rdx, r_nmsg
+    call tw_store
+    jmp ts_ret
+ts_fail:
+    lea rcx, s_twfail
+    call tw_fail
+ts_ret:
+    add rsp, 28h
+    ret
+tw_start ENDP
+
+; Fetches the signed-in account's ID and name -> eax = 1
+tw_getuser PROC
+    sub rsp, 28h
+    xor ecx, ecx
+    call tw_authhdr
+    lea rcx, w_twapi
+    lea rdx, w_pusers
+    lea r8, w_get
+    xor r9d, r9d
+    call tw_call
+    test eax, eax
+    jz tu_no
+    cmp r_status, 200
+    jne tu_no
+    lea rcx, s_jid
+    lea rdx, r_twid
+    mov r8d, 32
+    call json_copy
+    test eax, eax
+    jz tu_no
+    lea rcx, s_jlogin
+    lea rdx, r_twlogin
+    mov r8d, 64
+    call json_copy
+    test eax, eax
+    jnz tu_ret
+tu_no:
+    xor eax, eax
+tu_ret:
+    add rsp, 28h
+    ret
+tw_getuser ENDP
+
+; Asks Twitch whether the code has been approved yet
+tw_poll PROC
+    sub rsp, 28h
+    call [__imp_GetTickCount64]
+    cmp rax, r_twend
+    jae tp_fail
+    mov ecx, r_interval
+    add rax, rcx
+    mov r_twdue, rax
+    lea rcx, r_hdr
+    lea rdx, s_hform
+    call stpcpy
+    lea rcx, r_form
+    lea rdx, s_fclient
+    call stpcpy
+    mov rcx, rax
+    lea rdx, s_twclient
+    call url_enc
+    mov rcx, rax
+    lea rdx, s_fscopes
+    call stpcpy
+    mov rcx, rax
+    lea rdx, s_fdevice
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_devcode
+    call url_enc
+    mov rcx, rax
+    lea rdx, s_fgrant
+    call stpcpy
+    lea rcx, w_twid
+    lea rdx, w_ptoken
+    lea r8, w_post
+    lea r9, r_form
+    call tw_call
+    test eax, eax
+    jz tp_ret                       ; network trouble: try again next time
+    cmp r_status, 200
+    je tp_ok
+    lea rcx, r_buf
+    lea rdx, s_jpending
+    call strfind
+    test rax, rax
+    jnz tp_ret                      ; not approved yet
+    jmp tp_fail
+tp_ok:
+    lea rcx, s_jaccess
+    lea rdx, r_twaccess
+    mov r8d, 256
+    call json_copy
+    test eax, eax
+    jz tp_fail
+    lea rcx, s_jrefresh
+    lea rdx, r_twrefresh
+    mov r8d, 256
+    call json_copy
+    call tw_getuser
+    test eax, eax
+    jz tp_fail
+    lea rcx, r_nmsg
+    lea rdx, s_twas
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_twlogin
+    call stpcpy
+    mov ecx, 2
+    lea rdx, r_nmsg
+    xor r8d, r8d
+    call tw_store
+    jmp tp_ret
+tp_fail:
+    lea rcx, s_twfail
+    call tw_fail
+tp_ret:
+    add rsp, 28h
+    ret
+tw_poll ENDP
+
+; Swaps the refresh token for a new access token -> eax = 1. The old refresh token
+; only works once, so the new pair is saved straight away.
+tw_refresh PROC
+    sub rsp, 28h
+    cmp byte ptr r_twrefresh, 0
+    je tr_no
+    lea rcx, r_hdr
+    lea rdx, s_hform
+    call stpcpy
+    lea rcx, r_form
+    lea rdx, s_frefresh
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_twrefresh
+    call url_enc
+    mov rcx, rax
+    lea rdx, s_fclient2
+    call stpcpy
+    mov rcx, rax
+    lea rdx, s_twclient
+    call url_enc
+    lea rcx, w_twid
+    lea rdx, w_ptoken
+    lea r8, w_post
+    lea r9, r_form
+    call tw_call
+    test eax, eax
+    jz tr_no
+    cmp r_status, 200
+    jne tr_no
+    lea rcx, s_jaccess
+    lea rdx, r_twaccess
+    mov r8d, 256
+    call json_copy
+    test eax, eax
+    jz tr_no
+    lea rcx, s_jrefresh
+    lea rdx, r_twrefresh
+    mov r8d, 256
+    call json_copy
+    lea rcx, r_nmsg
+    lea rdx, s_twas
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_twlogin
+    call stpcpy
+    mov ecx, 2
+    lea rdx, r_nmsg
+    xor r8d, r8d
+    call tw_store
+    mov eax, 1
+    jmp tr_ret
+tr_no:
+    xor eax, eax
+tr_ret:
+    add rsp, 28h
+    ret
+tw_refresh ENDP
+
+; Posts the command once -> eax = 0 if the request itself failed
+tw_post_chat PROC
+    sub rsp, 28h
+    mov ecx, 1
+    call tw_authhdr
+    lea rcx, r_form
+    lea rdx, s_cbroad
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_twid
+    call stpcpy
+    mov rcx, rax
+    lea rdx, s_csender
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_twid
+    call stpcpy
+    mov rcx, rax
+    lea rdx, s_cmessage
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_chatcmd
+    call json_escape
+    mov rcx, rax
+    lea rdx, s_cend
+    call stpcpy
+    lea rcx, w_twapi
+    lea rdx, w_pchat
+    lea r8, w_post
+    lea r9, r_form
+    call tw_call
+    add rsp, 28h
+    ret
+tw_post_chat ENDP
+
+; Sends the Next song command to chat; the result goes in r_nmsg
+tw_chat PROC
+    sub rsp, 28h
+    cmp byte ptr r_chatcmd, 0
+    jne tc_go
+    lea rcx, r_nmsg
+    lea rdx, s_twnocmd
+    call stpcpy
+    jmp tc_ret
+tc_go:
+    call tw_post_chat
+    test eax, eax
+    jz tc_net
+    cmp r_status, 401               ; access tokens last about 4 hours
+    jne tc_check
+    call tw_refresh
+    test eax, eax
+    jnz tc_again
+    lea rcx, s_twexpired
+    call tw_fail
+    lea rcx, r_nmsg
+    lea rdx, s_twexpired
+    call stpcpy
+    jmp tc_ret
+tc_again:
+    call tw_post_chat
+    test eax, eax
+    jz tc_net
+tc_check:
+    cmp r_status, 200
+    jne tc_err
+    lea rcx, s_jsent
+    call json_val
+    test rax, rax
+    jz tc_err
+    cmp byte ptr [rax], 't'         ; true
+    jne tc_err
+    mov r_chatsent, 1
+    lea rcx, r_nmsg
+    lea rdx, s_twsent1
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_chatcmd
+    call stpcpy
+    mov rcx, rax
+    lea rdx, s_twsent2
+    call stpcpy
+    jmp tc_ret
+tc_err:
+    lea rcx, s_jmessage             ; Twitch's reason, including dropped messages
+    lea rdx, r_nmsg
+    mov r8d, 512
+    call json_copy
+    test eax, eax
+    jnz tc_ret
+    mov eax, r_status
+    mov r_err, eax
+tc_net:
+    lea rcx, r_nmsg
+    lea rdx, s_twsenderr
+    call stpcpy
+    mov ecx, r_err
+    mov rdx, rax
+    call utoa
+    mov rcx, rax
+    lea rdx, s_rparen
+    call stpcpy
+tc_ret:
+    add rsp, 28h
+    ret
+tw_chat ENDP
+
+; Sign out clicked: tells Twitch to cancel the token, then forgets it
+tw_signout PROC
+    sub rsp, 28h
+    call tw_load
+    cmp byte ptr r_twaccess, 0
+    je to_done
+    lea rcx, r_hdr
+    lea rdx, s_hform
+    call stpcpy
+    lea rcx, r_form
+    lea rdx, s_fclient
+    call stpcpy
+    mov rcx, rax
+    lea rdx, s_twclient
+    call url_enc
+    mov rcx, rax
+    lea rdx, s_ftoken
+    call stpcpy
+    mov rcx, rax
+    lea rdx, r_twaccess
+    call url_enc
+    lea rcx, w_twid
+    lea rdx, w_prevoke
+    lea r8, w_post
+    lea r9, r_form
+    call tw_call
+to_done:
+    lea rcx, s_twoff
+    call tw_fail
+    add rsp, 28h
+    ret
+tw_signout ENDP
+
+; Next song was clicked: asks Ouvert once, with the private key, and never retries,
+; since the request may have worked even if the answer got lost. Always reports
+; back, which re-enables the button.
+req_next PROC
+    sub rsp, 28h
+    mov r_chatsent, 0
+    call tw_load
+    cmp byte ptr r_twaccess, 0      ; signed in to Twitch: use the bot's chat command,
+    je rn2_api                      ; so the bot announces the song
+    call tw_chat
+    jmp rn2_done
+rn2_api:
+    CS_ENTER
+    lea rcx, r_key
+    lea rdx, g_ouvertp
+    call stpcpy
+    CS_LEAVE
+    cmp byte ptr r_key, 0
+    jne rn2_go
+    lea rcx, r_nmsg
+    lea rdx, s_nnokey
+    call stpcpy
+    jmp rn2_done
+rn2_go:
+    lea rax, w_onext
+    mov r_path, rax
+    call req_fetch
+    lea rcx, w_opath
+    mov r_path, rcx
+    test eax, eax
+    jnz rn2_got
+    lea rcx, r_nmsg
+    lea rdx, s_rneterr
+    call stpcpy
+    mov ecx, r_err
+    mov rdx, rax
+    call utoa
+    mov rcx, rax
+    lea rdx, s_rparen
+    call stpcpy
+    jmp rn2_done
+rn2_got:
+    mov byte ptr r_nmsg, 0
+    lea rcx, r_buf
+    lea rdx, s_rmsg
+    call strfind
+    test rax, rax
+    jz rn2_nomsg
+    mov rcx, rax
+    lea rdx, r_nmsg
+    mov r8d, 512
+    call copy_jstr
+    lea rcx, r_nmsg
+    call unescape
+    cmp byte ptr r_nmsg, 0
+    jne rn2_done
+rn2_nomsg:
+    lea rcx, r_buf
+    lea rdx, s_rstatus
+    call strfind
+    lea rdx, s_nok
+    test rax, rax
+    jnz rn2_set
+    lea rdx, s_nbad
+rn2_set:
+    lea rcx, r_nmsg
+    call stpcpy
+rn2_done:
+    CS_ENTER
+    lea rcx, g_nextmsg
+    lea rdx, r_nmsg
+    call stpcpy
+    CS_LEAVE
+    mov rcx, g_hDlg
+    mov edx, WM_APP_NEXTDONE
+    xor r8d, r8d
+    xor r9d, r9d
+    call [__imp_PostMessageA]
+    cmp r_chatsent, 0               ; give the bot a moment before refreshing the queue
+    je rn2_ret
+    mov ecx, 1500
+    call [__imp_Sleep]
+rn2_ret:
+    add rsp, 28h
+    ret
+req_next ENDP
+
+; Thread: only contacts Ouvert while the Requests page is on screen
+req_thread PROC
+    sub rsp, 28h
+    lea rax, w_opath
+    mov r_path, rax
+rt_loop:
+    mov rcx, g_hReqEvent
+    mov edx, REQ_POLL_MS
+    call [__imp_WaitForSingleObject]
+    xor eax, eax
+    xchg eax, g_twaction
+    cmp eax, 1
+    jne rt_a2
+    call tw_start
+    jmp rt_tw
+rt_a2:
+    cmp eax, 2
+    jne rt_a3
+    call tw_signout
+    jmp rt_tw
+rt_a3:
+    cmp eax, 3
+    jne rt_tw
+    lea rcx, s_twoff
+    call tw_fail
+rt_tw:
+    cmp g_twstate, 1                ; waiting for the code to be approved
+    jne rt_next
+    call [__imp_GetTickCount64]
+    cmp rax, r_twdue
+    jb rt_next
+    call tw_poll
+rt_next:
+    xor eax, eax
+    xchg eax, g_reqnext
+    test eax, eax
+    jz rt_page
+    call req_next
+rt_page:
+    cmp g_page, PAGE_REQUESTS
+    jne rt_loop
+    mov rcx, g_hDlg
+    call [__imp_IsWindowVisible]
+    test eax, eax
+    jz rt_loop
+    CS_ENTER
+    lea rcx, r_key
+    lea rdx, g_ouvert
+    call stpcpy
+    CS_LEAVE
+    cmp byte ptr r_key, 0
+    jne rt_fetch
+    lea rcx, r_list
+    lea rdx, s_rnokey
+    call stpcpy
+    jmp rt_pub
+rt_fetch:
+    call req_fetch
+    test eax, eax
+    jnz rt_parse
+    lea rcx, r_list
+    lea rdx, s_rneterr
+    call stpcpy
+    mov ecx, r_err
+    mov rdx, rax
+    call utoa
+    mov rcx, rax
+    lea rdx, s_rretry
+    call stpcpy
+    jmp rt_pub
+rt_parse:
+    call req_parse
+    test eax, eax
+    jnz rt_pub
+    lea rcx, r_list
+    lea rdx, s_rbad
+    call stpcpy
+rt_pub:
+    call req_publish
+    jmp rt_loop
+req_thread ENDP
+
 ; ---- UI thread -------------------------------------------------------------------
 
 ; ecx = control id, rdx = UTF-8 text
@@ -2159,6 +3898,229 @@ us_set:
     ret
 update_status ENDP
 
+; Shows the lines in g_reqtext on the Requests page
+req_show PROC
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    sub rsp, 28h
+    xor r12d, r12d                  ; longest line
+    mov ecx, IDC_REQLIST
+    mov edx, 18Eh                   ; LB_GETTOPINDEX
+    xor r8d, r8d
+    xor r9d, r9d
+    call send_dlg
+    mov rbx, rax
+    CS_ENTER
+    mov ecx, IDC_REQLIST
+    mov edx, 184h                   ; LB_RESETCONTENT
+    xor r8d, r8d
+    xor r9d, r9d
+    call send_dlg
+    lea rsi, g_reqtext
+rs_line:
+    cmp byte ptr [rsi], 0
+    je rs_done
+    lea rdi, g_uitmp2
+rs_c:
+    mov al, [rsi]
+    test al, al
+    jz rs_add
+    inc rsi
+    cmp al, 0Ah
+    je rs_add
+    mov [rdi], al
+    inc rdi
+    jmp rs_c
+rs_add:
+    mov byte ptr [rdi], 0
+    lea rax, g_uitmp2
+    sub rdi, rax
+    cmp rdi, r12
+    jbe rs_add2
+    mov r12, rdi
+rs_add2:
+    mov ecx, IDC_REQLIST
+    mov edx, 180h                   ; LB_ADDSTRING
+    lea r8, g_uitmp2
+    call add_string
+    jmp rs_line
+rs_done:
+    CS_LEAVE
+    ; scrollbar for long lines: an average character is 4 dialog units wide
+    and qword ptr g_rc, 0
+    and qword ptr g_rc+8, 0
+    lea eax, [r12*4+8]
+    mov dword ptr g_rc+8, eax
+    mov rcx, g_hDlg
+    lea rdx, g_rc
+    call [__imp_MapDialogRect]
+    mov ecx, IDC_REQLIST
+    mov edx, 194h                   ; LB_SETHORIZONTALEXTENT
+    mov r8d, dword ptr g_rc+8
+    xor r9d, r9d
+    call send_dlg
+    mov ecx, IDC_REQLIST
+    mov edx, 197h                   ; LB_SETTOPINDEX
+    mov r8, rbx
+    xor r9d, r9d
+    call send_dlg
+    add rsp, 28h
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+req_show ENDP
+
+; Records the layout from chss.rc, which resizing is measured against
+layout_init PROC
+    push rbx
+    push rsi
+    push rdi
+    sub rsp, 20h
+    mov rcx, g_hDlg
+    lea rdx, g_rc
+    call [__imp_GetClientRect]
+    mov eax, dword ptr g_rc+8
+    mov g_cw0, eax
+    mov eax, dword ptr g_rc+12
+    mov g_ch0, eax
+    mov rcx, g_hDlg
+    lea rdx, g_rc
+    call [__imp_GetWindowRect]
+    mov eax, dword ptr g_rc+8
+    sub eax, dword ptr g_rc
+    mov g_minw, eax
+    mov eax, dword ptr g_rc+12
+    sub eax, dword ptr g_rc+4
+    mov g_minh, eax
+    lea rsi, layout_tbl
+    lea rdi, g_lay
+li_l:
+    movzx edx, word ptr [rsi]
+    test edx, edx
+    jz li_done
+    mov rcx, g_hDlg
+    call [__imp_GetDlgItem]
+    mov [rdi], rax
+    mov rcx, rax
+    lea rdx, g_rc
+    call [__imp_GetWindowRect]
+    xor ecx, ecx                    ; from the screen...
+    mov rdx, g_hDlg                 ; ...to the window
+    lea r8, g_rc
+    mov r9d, 2
+    call [__imp_MapWindowPoints]
+    mov eax, dword ptr g_rc
+    mov [rdi+8], eax
+    mov ecx, dword ptr g_rc+4
+    mov [rdi+12], ecx
+    mov edx, dword ptr g_rc+8
+    sub edx, eax
+    mov [rdi+16], edx
+    mov edx, dword ptr g_rc+12
+    sub edx, ecx
+    mov [rdi+20], edx
+    add rsi, 4
+    add rdi, 32
+    jmp li_l
+li_done:
+    mov g_laydone, 1
+    add rsp, 20h
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+layout_init ENDP
+
+; ecx = client width, edx = client height: moves the controls to fit
+layout_apply PROC
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    sub rsp, 30h
+    mov r12d, ecx
+    sub r12d, g_cw0
+    mov r13d, edx
+    sub r13d, g_ch0
+    lea rsi, layout_tbl
+    lea rdi, g_lay
+la_l:
+    movzx ebx, word ptr [rsi+2]
+    cmp word ptr [rsi], 0
+    je la_done
+    mov rcx, [rdi]
+    mov edx, [rdi+8]
+    mov r8d, [rdi+12]
+    mov r9d, [rdi+16]
+    mov eax, [rdi+20]
+    test ebx, 1
+    jz la_1
+    add edx, r12d
+la_1:
+    test ebx, 2
+    jz la_2
+    add r8d, r13d
+la_2:
+    test ebx, 4
+    jz la_3
+    add r9d, r12d
+la_3:
+    test ebx, 8
+    jz la_4
+    add eax, r13d
+la_4:
+    mov [rsp+20h], rax
+    mov qword ptr [rsp+28h], 1      ; repaint
+    call [__imp_MoveWindow]
+    add rsi, 4
+    add rdi, 32
+    jmp la_l
+la_done:
+    add rsp, 30h
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+layout_apply ENDP
+
+; Shows the Twitch status and the matching button label
+tw_ui PROC
+    sub rsp, 28h
+    CS_ENTER
+    mov ecx, IDC_TWSTAT
+    lea rdx, g_twstat
+    call set_text_u8
+    lea r8, s_twbsignin
+    mov eax, g_twstate
+    cmp eax, 1
+    jne tu2_a
+    lea r8, s_twbcancel
+tu2_a:
+    cmp eax, 2
+    jne tu2_b
+    lea r8, s_twbsignout
+tu2_b:
+    mov rcx, g_hDlg
+    mov edx, IDC_TWBTN
+    call [__imp_SetDlgItemTextA]
+    CS_LEAVE
+    mov rcx, g_hDlg
+    mov edx, IDC_TWBTN
+    call [__imp_GetDlgItem]
+    mov rcx, rax
+    mov edx, 1
+    call [__imp_EnableWindow]
+    add rsp, 28h
+    ret
+tw_ui ENDP
+
 ; Fill the page list
 refresh_nav PROC
     push rbx
@@ -2170,7 +4132,7 @@ refresh_nav PROC
     call send_dlg
     mov ecx, IDC_NAV
     mov edx, 180h                   ; LB_ADDSTRING
-    lea r8, s_navconn
+    lea r8, s_navreq
     call add_string
     mov ecx, IDC_NAV
     mov edx, 180h
@@ -2182,7 +4144,7 @@ refresh_nav PROC
     call add_string
     mov ecx, IDC_NAV
     mov edx, 180h
-    lea r8, s_navfile
+    lea r8, s_navset
     call add_string
     mov ecx, IDC_NAV
     mov edx, 186h                   ; LB_SETCURSEL
@@ -2329,6 +4291,16 @@ DlgProc PROC
     je dp_scenes
     cmp edx, WM_APP_TRAY
     je dp_tray
+    cmp edx, WM_APP_REQS
+    je dp_reqs
+    cmp edx, WM_APP_NEXTDONE
+    je dp_nextdone
+    cmp edx, WM_APP_TWITCH
+    je dp_twitch
+    cmp edx, 5                      ; WM_SIZE
+    je dp_size
+    cmp edx, 24h                    ; WM_GETMINMAXINFO
+    je dp_minmax
     cmp edx, 138h                   ; WM_CTLCOLORSTATIC
     je dp_ctlstatic
     cmp edx, 136h                   ; WM_CTLCOLORDLG
@@ -2391,6 +4363,27 @@ di_themed:
     mov ecx, IDC_PASS
     lea rdx, g_pass
     call set_text_u8
+    mov ecx, IDC_OUVERT
+    lea rdx, g_ouvert
+    call set_text_u8
+    mov ecx, IDC_OUVERTP
+    lea rdx, g_ouvertp
+    call set_text_u8
+    mov ecx, IDC_CHATCMD
+    lea rdx, g_chatcmd
+    call set_text_u8
+    lea rcx, g_twstat
+    lea rdx, s_twoff
+    cmp byte ptr g_twaccess, 0
+    je di_twoff
+    mov g_twstate, 2
+    lea rdx, s_twas
+    call stpcpy
+    mov rcx, rax
+    lea rdx, g_twlogin
+di_twoff:
+    call stpcpy
+    call tw_ui
     mov rcx, rbx
     mov edx, IDC_DELAY
     lea r8, g_delay
@@ -2407,11 +4400,12 @@ di_themed:
     jne di_page
     cmp byte ptr g_mpsong, 0
     jne di_page
-    xor eax, eax
+    mov eax, PAGE_SETTINGS
 di_page:
     mov g_page, eax
     call refresh_nav
     call show_page
+    call layout_init
     ; tray icon
     mov dword ptr g_nid, 528
     mov qword ptr g_nid+8, rbx
@@ -2431,6 +4425,15 @@ di_page:
     xor ecx, ecx
     xor edx, edx
     lea r8, worker
+    xor r9d, r9d
+    and qword ptr [rsp+20h], 0
+    and qword ptr [rsp+28h], 0
+    call [__imp_CreateThread]
+    mov rcx, rax
+    call [__imp_CloseHandle]
+    xor ecx, ecx
+    xor edx, edx
+    lea r8, req_thread
     xor r9d, r9d
     and qword ptr [rsp+20h], 0
     and qword ptr [rsp+28h], 0
@@ -2473,7 +4476,93 @@ dp_cmd:
     je dc_nav
     cmp eax, IDC_USEMODE
     je dc_usemode
+    cmp eax, IDC_OUVERT
+    je dc_ouvert
+    cmp eax, IDC_OUVERTP
+    je dc_ouvertp
+    cmp eax, IDC_NEXT
+    je dc_next
+    cmp eax, IDC_TWBTN
+    je dc_twbtn
+    cmp eax, IDC_CHATCMD
+    je dc_chatcmd
     jmp dp_true                     ; swallow Enter/Esc (IDOK/IDCANCEL)
+
+dc_ouvert:
+    cmp r12d, 300h                  ; EN_CHANGE
+    jne dp_true
+    CS_ENTER
+    mov ecx, IDC_OUVERT
+    lea rdx, g_ouvert
+    mov r8d, 128
+    call get_text_u8
+    jmp dc_unlock
+
+dc_ouvertp:
+    cmp r12d, 300h                  ; EN_CHANGE
+    jne dp_true
+    CS_ENTER
+    mov ecx, IDC_OUVERTP
+    lea rdx, g_ouvertp
+    mov r8d, 128
+    call get_text_u8
+    jmp dc_unlock
+
+dc_chatcmd:
+    cmp r12d, 300h                  ; EN_CHANGE
+    jne dp_true
+    CS_ENTER
+    mov ecx, IDC_CHATCMD
+    lea rdx, g_chatcmd
+    mov r8d, 64
+    call get_text_u8
+    jmp dc_unlock
+
+dc_twbtn:
+    test r12d, r12d
+    jnz dp_true
+    ; state 0 -> sign in (1), 2 -> sign out (2), 1 -> cancel (3); disabled until it's done
+    mov eax, 1
+    mov ecx, g_twstate
+    cmp ecx, 2
+    jne dt_a1
+    mov eax, 2
+dt_a1:
+    cmp ecx, 1
+    jne dt_a2
+    mov eax, 3
+dt_a2:
+    mov g_twaction, eax
+    mov rcx, rbx
+    mov edx, IDC_TWBTN
+    call [__imp_GetDlgItem]
+    mov rcx, rax
+    xor edx, edx
+    call [__imp_EnableWindow]
+    mov rcx, g_hReqEvent
+    call [__imp_SetEvent]
+    jmp dp_true
+
+dc_next:
+    test r12d, r12d
+    jnz dp_true
+    ; one request at a time until Ouvert answers, so a double click can't skip two songs
+    cmp g_nextbusy, 0
+    jne dp_true
+    mov g_nextbusy, 1
+    mov rcx, rbx
+    mov edx, IDC_NEXT
+    call [__imp_GetDlgItem]
+    mov rcx, rax
+    xor edx, edx
+    call [__imp_EnableWindow]
+    mov ecx, IDC_NEXTMSG
+    lea rdx, s_empty
+    call set_text_u8
+    mov g_reqnext, 1
+    mov rcx, g_hReqEvent
+    call [__imp_SetEvent]
+    jmp dp_true
 
 dc_nav:
     cmp r12d, 1                     ; LBN_SELCHANGE
@@ -2483,9 +4572,10 @@ dc_nav:
     xor r8d, r8d
     xor r9d, r9d
     call send_dlg
-    cmp eax, 3
+    cmp eax, PAGE_SETTINGS
     ja dp_true
     mov g_page, eax
+    mov r12d, eax
     dec eax                         ; a mode page -> the mode being viewed
     cmp eax, 1
     ja dn_show
@@ -2495,6 +4585,10 @@ dc_nav:
     CS_LEAVE
 dn_show:
     call show_page
+    cmp r12d, PAGE_REQUESTS
+    jne dp_true
+    mov rcx, g_hReqEvent            ; fetch the queue now
+    call [__imp_SetEvent]
     jmp dp_true
 
 dc_usemode:
@@ -2517,7 +4611,7 @@ dc_usemode:
 dc_connect:
     test r12d, r12d
     jnz dp_true
-    cmp g_page, 0                   ; Enter on another page
+    cmp g_page, PAGE_SETTINGS       ; Enter on another page
     jne dp_true
     mov ecx, IDC_PORT
     lea rdx, g_uitmp
@@ -2693,6 +4787,61 @@ dp_scenes:
     call fill_scenes
     jmp dp_true
 
+dp_reqs:
+    call req_show
+    jmp dp_true
+
+dp_twitch:
+    call save_settings
+    call tw_ui
+ifndef CHSS_TEST
+    test rsi, rsi                   ; open the sign-in page
+    jz dp_true
+    xor ecx, ecx
+    lea rdx, s_open
+    lea r8, r_verif
+    xor r9d, r9d
+    and qword ptr [rsp+20h], 0
+    mov qword ptr [rsp+28h], 1      ; SW_SHOWNORMAL
+    call [__imp_ShellExecuteA]
+endif
+    jmp dp_true
+
+dp_nextdone:
+    mov g_nextbusy, 0
+    CS_ENTER
+    mov ecx, IDC_NEXTMSG
+    lea rdx, g_nextmsg
+    call set_text_u8
+    CS_LEAVE
+    mov rcx, rbx
+    mov edx, IDC_NEXT
+    call [__imp_GetDlgItem]
+    mov rcx, rax
+    mov edx, 1
+    call [__imp_EnableWindow]
+    jmp dp_true
+
+dp_size:
+    cmp rsi, 1                      ; SIZE_MINIMIZED
+    je dp_false
+    cmp g_laydone, 0
+    je dp_false
+    movzx ecx, di
+    mov edx, edi
+    shr edx, 16
+    call layout_apply
+    jmp dp_true
+
+dp_minmax:
+    mov eax, g_minw
+    test eax, eax
+    jz dp_false
+    mov [rdi+24], eax               ; MINMAXINFO.ptMinTrackSize
+    mov eax, g_minh
+    mov [rdi+28], eax
+    jmp dp_true
+
 dp_ctlstatic:
     mov rcx, rdi
     call [__imp_GetDlgCtrlID]
@@ -2840,6 +4989,8 @@ dt_show:
     call [__imp_ShowWindow]
     mov rcx, rbx
     call [__imp_SetForegroundWindow]
+    mov rcx, g_hReqEvent            ; back on screen: refresh the queue if it's showing
+    call [__imp_SetEvent]
     jmp dp_true
 DlgProc ENDP
 
@@ -2854,11 +5005,17 @@ main PROC
     xor ecx, ecx
     call [__imp_GetModuleHandleA]
     mov g_hInst, rax
+    lea rcx, g_cs
+    call [__imp_InitializeCriticalSection]
     call init_paths
     call load_settings
     call migrate
     call load_settings
     call find_song_file
+    cmp g_resave, 0                 ; replaces plain-text secrets from older versions
+    je mn_saved
+    call save_settings
+mn_saved:
     xor eax, eax
     cmp byte ptr g_modestr, '1'
     sete al
@@ -2870,8 +5027,6 @@ main PROC
     xor eax, eax
 mn_dl:
     mov g_delayms, rax
-    lea rcx, g_cs
-    call [__imp_InitializeCriticalSection]
     xor ebx, ebx
 mn_br:
     lea rax, brush_clr
@@ -2888,6 +5043,12 @@ mn_br:
     xor r9d, r9d
     call [__imp_CreateEventA]
     mov g_hEvent, rax
+    xor ecx, ecx
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
+    call [__imp_CreateEventA]
+    mov g_hReqEvent, rax
     mov rcx, g_hInst
     mov edx, 1                      ; dialog resource id
     xor r8d, r8d

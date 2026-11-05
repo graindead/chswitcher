@@ -17,6 +17,8 @@
 #define IDC_DOT     115
 #define IDC_STATUS  116
 #define IDC_DIVIDER 117
+#define IDC_OUVERT  118
+#define IDC_REQLIST 119
 // page labels (shown and hidden with their page)
 #define IDL_HOST    120
 #define IDL_PORT    121
@@ -25,26 +27,48 @@
 #define IDL_MENU    124
 #define IDL_FILE    125
 #define IDL_DELAY   126
+#define IDL_OUVERT  127
+#define IDC_OUVERTP 128
+#define IDL_OUVERTP 129
+#define IDC_NEXT    130
+#define IDC_NEXTMSG 131
+#define IDC_TWSTAT  132
+#define IDC_TWBTN   133
+#define IDL_CHATCMD 134
+#define IDC_CHATCMD 135
 
 // Two panes: the page list on the left (drawn by the app), the selected page on
 // the right. Every page's controls are here; the app shows only the current page's.
-1 DIALOGEX 0, 0, 250, 102
-STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+1 DIALOGEX 0, 0, 250, 231
+STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME | WS_CLIPCHILDREN
 CAPTION "CH Scene Switcher"
 FONT 9, "Segoe UI"
 BEGIN
-    CONTROL         "", IDC_NAV, "ListBox", LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_TABSTOP, 0, 4, 66, 98
-    LTEXT           "", IDC_DIVIDER, 66, 0, 1, 102
+    CONTROL         "", IDC_NAV, "ListBox", LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_TABSTOP, 0, 4, 66, 227
+    LTEXT           "", IDC_DIVIDER, 66, 0, 1, 231
 
-    // Connection
-    LTEXT           "Server IP", IDL_HOST, 76, 8, 166, 8
-    EDITTEXT        IDC_HOST, 76, 18, 166, 12, ES_AUTOHSCROLL
-    LTEXT           "Port", IDL_PORT, 76, 36, 44, 8
-    EDITTEXT        IDC_PORT, 76, 46, 44, 12, ES_NUMBER
-    LTEXT           "Password", IDL_PASS, 128, 36, 114, 8
-    EDITTEXT        IDC_PASS, 128, 46, 114, 12, ES_PASSWORD | ES_AUTOHSCROLL
-    LTEXT           "", IDC_CONN, 76, 63, 110, 17, SS_NOPREFIX
-    DEFPUSHBUTTON   "Connect", IDC_CONNECT, 192, 62, 50, 14
+    // Settings
+    LTEXT           "Server IP", IDL_HOST, 76, 8, 114, 8
+    EDITTEXT        IDC_HOST, 76, 18, 114, 12, ES_AUTOHSCROLL
+    LTEXT           "Port", IDL_PORT, 198, 8, 44, 8
+    EDITTEXT        IDC_PORT, 198, 18, 44, 12, ES_NUMBER
+    LTEXT           "Password", IDL_PASS, 76, 35, 114, 8
+    EDITTEXT        IDC_PASS, 76, 45, 114, 12, ES_PASSWORD | ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "Connect", IDC_CONNECT, 198, 44, 44, 14
+    LTEXT           "", IDC_CONN, 76, 61, 166, 17, SS_NOPREFIX
+    LTEXT           "Ouvert public API key", IDL_OUVERT, 76, 81, 166, 8
+    EDITTEXT        IDC_OUVERT, 76, 91, 166, 12, ES_PASSWORD | ES_AUTOHSCROLL
+    LTEXT           "Ouvert private API key", IDL_OUVERTP, 76, 108, 166, 8
+    EDITTEXT        IDC_OUVERTP, 76, 118, 166, 12, ES_PASSWORD | ES_AUTOHSCROLL
+    LTEXT           "Current Song File", IDL_FILE, 76, 135, 166, 8
+    EDITTEXT        IDC_FILE, 76, 145, 142, 12, ES_AUTOHSCROLL
+    PUSHBUTTON      "...", IDC_BROWSE, 221, 144, 21, 14
+    LTEXT           "Delay before the menu scene (sec)", IDL_DELAY, 76, 165, 132, 8
+    EDITTEXT        IDC_DELAY, 212, 163, 30, 12, ES_AUTOHSCROLL
+    LTEXT           "Twitch: not signed in", IDC_TWSTAT, 76, 182, 110, 9, SS_ENDELLIPSIS | SS_NOPREFIX
+    PUSHBUTTON      "Sign in to Twitch", IDC_TWBTN, 188, 179, 54, 14
+    LTEXT           "Chat command for Next song", IDL_CHATCMD, 76, 199, 110, 8
+    EDITTEXT        IDC_CHATCMD, 188, 197, 54, 12, ES_AUTOHSCROLL
 
     // Singleplayer / Multiplayer (same controls, showing the selected mode's scenes)
     LTEXT           "Song playing", IDL_SONG, 76, 8, 166, 8
@@ -52,23 +76,21 @@ BEGIN
     LTEXT           "In menus", IDL_MENU, 76, 36, 166, 8
     COMBOBOX        IDC_MENU, 76, 46, 166, 200, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 
-    // Song file
-    LTEXT           "Song file", IDL_FILE, 76, 8, 166, 8
-    EDITTEXT        IDC_FILE, 76, 18, 142, 12, ES_AUTOHSCROLL
-    PUSHBUTTON      "...", IDC_BROWSE, 221, 17, 21, 14
-    LTEXT           "Delay before switching to the menu scene (sec)", IDL_DELAY, 76, 36, 166, 8
-    EDITTEXT        IDC_DELAY, 76, 46, 30, 12, ES_AUTOHSCROLL
+    // Requests
+    LISTBOX         IDC_REQLIST, 76, 8, 166, 179, LBS_NOSEL | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL | NOT WS_BORDER
+    PUSHBUTTON      "Next song", IDC_NEXT, 76, 191, 50, 14
+    LTEXT           "", IDC_NEXTMSG, 132, 194, 110, 9, SS_ENDELLIPSIS | SS_NOPREFIX
 
     // status row, on every page
-    LTEXT           "", IDC_DOT, 76, 85, 7, 9, SS_NOPREFIX
-    LTEXT           "", IDC_STATUS, 84, 85, 100, 9, SS_ENDELLIPSIS | SS_NOPREFIX
-    PUSHBUTTON      "Use this mode", IDC_USEMODE, 186, 82, 56, 14
-    RTEXT           "Active mode", IDC_ACTIVE, 186, 85, 56, 9
+    LTEXT           "", IDC_DOT, 76, 214, 7, 9, SS_NOPREFIX
+    LTEXT           "", IDC_STATUS, 84, 214, 100, 9, SS_ENDELLIPSIS | SS_NOPREFIX
+    PUSHBUTTON      "Use this mode", IDC_USEMODE, 186, 211, 56, 14
+    RTEXT           "Active mode", IDC_ACTIVE, 186, 214, 56, 9
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,3,0,0
-PRODUCTVERSION  1,3,0,0
+FILEVERSION     1,6,0,0
+PRODUCTVERSION  1,6,0,0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
@@ -77,11 +99,11 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "FileDescription",  "Switches OBS scenes when Clone Hero starts and ends songs"
-            VALUE "FileVersion",      "1.3.0.0"
+            VALUE "FileVersion",      "1.6.0.0"
             VALUE "InternalName",     "chss"
             VALUE "OriginalFilename", "CH Scene Switcher.exe"
             VALUE "ProductName",      "CH Scene Switcher"
-            VALUE "ProductVersion",   "1.3.0.0"
+            VALUE "ProductVersion",   "1.6.0.0"
         END
     END
     BLOCK "VarFileInfo"
