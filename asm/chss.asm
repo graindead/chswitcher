@@ -72,6 +72,7 @@ IMP GetOpenFileNameA
 IMP InitCommonControls
 IMP GetDlgItem
 IMP MoveWindow
+IMP SetWindowPos
 IMP EnableWindow
 IMP ShellExecuteA
 IMP WinHttpQueryHeaders
@@ -123,7 +124,7 @@ endm
 RBUF_SIZE   equ 262144
 TEXTSIZE    equ 4096
 MAXSCENES   equ 256
-NSET        equ 17
+NSET        equ 18
 REQ_POLL_MS equ 5000
 REQ_MAX     equ 100             ; requests shown
 RESP_SIZE   equ 131072
@@ -167,6 +168,8 @@ IDC_TWSTAT  equ 132
 IDC_TWBTN   equ 133
 IDL_CHATCMD equ 134
 IDC_CHATCMD equ 135
+IDC_ONTOP   equ 136
+IDL_ONTOP   equ 137
 ID_SHOW     equ 200
 ID_EXIT     equ 201
 
@@ -233,6 +236,7 @@ k_twrefresh db 'twitch_refresh_token',0
 k_twid      db 'twitch_user_id',0
 k_twlogin   db 'twitch_login',0
 k_chatcmd   db 'next_chat_command',0
+k_ontop     db 'keep_on_top',0
 d_chatcmd   db '!playnext',0
 d_host      db 'localhost',0
 d_port      db '4455',0
@@ -423,6 +427,7 @@ settings_secret label qword
              dq k_twid, g_twid, 32, s_empty
              dq k_twlogin, g_twlogin, 64, s_empty
              dq k_chatcmd, g_chatcmd, 64, d_chatcmd
+             dq k_ontop, g_ontop, 4, d_delay       ; "1" = keep the window on top
 ; settings.json patterns, in settings_tbl order (ending in " = string value, else number)
 mig_tbl      dq m_host, m_port, m_pass, m_song, m_menu, m_delay, m_file, 0
 sfx_tbl      dq sfx1, sfx2, sfx3, 0
@@ -433,13 +438,13 @@ layout_tbl   dw IDC_NAV, 8, IDC_DIVIDER, 8, IDC_REQLIST, 12, IDC_NEXT, 2, IDC_NE
              dw IDC_CONNECT, 1, IDC_CONN, 4, IDL_OUVERT, 4, IDC_OUVERT, 4, IDL_OUVERTP, 4, IDC_OUVERTP, 4
              dw IDL_FILE, 4, IDC_FILE, 4, IDC_BROWSE, 1, IDC_DELAY, 1
              dw IDL_SONG, 4, IDC_SONG, 4, IDL_MENU, 4, IDC_MENU, 4
-             dw IDC_TWSTAT, 4, IDC_TWBTN, 1, IDC_CHATCMD, 1
+             dw IDC_TWSTAT, 4, IDC_TWBTN, 1, IDC_CHATCMD, 1, IDC_ONTOP, 1
              dw IDC_DOT, 2, IDC_STATUS, 6, IDC_USEMODE, 3, IDC_ACTIVE, 3, 0
 ; brushes made in main, in g_hBgBrush order
 brush_clr    dd CLR_BG, CLR_FIELD, CLR_SELBG, CLR_DIVIDER
 ; controls drawn with Windows' dark styles: 0 = DarkMode_CFD (fields), 1 = DarkMode_Explorer (buttons)
 theme_tbl    dw IDC_HOST, 0, IDC_PORT, 0, IDC_PASS, 0, IDC_FILE, 0, IDC_DELAY, 0
-             dw IDC_SONG, 0, IDC_MENU, 0, IDC_OUVERT, 0, IDC_OUVERTP, 0, IDC_REQLIST, 1, IDC_NEXT, 1, IDC_TWBTN, 1, IDC_CHATCMD, 0, IDC_CONNECT, 1, IDC_BROWSE, 1, IDC_USEMODE, 1, 0
+             dw IDC_SONG, 0, IDC_MENU, 0, IDC_OUVERT, 0, IDC_OUVERTP, 0, IDC_REQLIST, 1, IDC_NEXT, 1, IDC_TWBTN, 1, IDC_ONTOP, 1, IDC_CHATCMD, 0, IDC_CONNECT, 1, IDC_BROWSE, 1, IDC_USEMODE, 1, 0
 w_darkcfd    dw 'D','a','r','k','M','o','d','e','_','C','F','D',0
 w_darkexp    dw 'D','a','r','k','M','o','d','e','_','E','x','p','l','o','r','e','r',0
 align 4
@@ -450,7 +455,7 @@ page_tbl     dw IDL_HOST, 8, IDC_HOST, 8, IDL_PORT, 8, IDC_PORT, 8
              dw IDL_PASS, 8, IDC_PASS, 8, IDC_CONNECT, 8, IDC_CONN, 8
              dw IDL_OUVERT, 8, IDC_OUVERT, 8, IDL_OUVERTP, 8, IDC_OUVERTP, 8
              dw IDL_FILE, 8, IDC_FILE, 8, IDC_BROWSE, 8
-             dw IDL_DELAY, 8, IDC_DELAY, 8, IDC_TWSTAT, 8, IDC_TWBTN, 8, IDL_CHATCMD, 8, IDC_CHATCMD, 8
+             dw IDL_DELAY, 8, IDC_DELAY, 8, IDC_TWSTAT, 8, IDC_TWBTN, 8, IDL_CHATCMD, 8, IDC_CHATCMD, 8, IDL_ONTOP, 8, IDC_ONTOP, 8
              dw IDL_SONG, 6, IDC_SONG, 6, IDL_MENU, 6, IDC_MENU, 6
              dw IDC_REQLIST, 1, IDC_NEXT, 1, IDC_NEXTMSG, 1
              dw IDC_USEMODE, 80h, IDC_ACTIVE, 40h, 0
@@ -579,6 +584,7 @@ g_twrefresh db 256 dup(?)
 g_twid      db 32 dup(?)
 g_twlogin   db 64 dup(?)
 g_chatcmd   db 64 dup(?)
+g_ontop     db 4 dup(?)
 g_twstat    db 512 dup(?)
 g_nextmsg   db 512 dup(?)   ; result of Next song (under g_cs)
 r_nmsg      db 512 dup(?)
@@ -4121,6 +4127,25 @@ tu2_b:
     ret
 tw_ui ENDP
 
+; Puts the window on top of other windows, or back among them, per g_ontop
+apply_ontop PROC
+    sub rsp, 48h
+    mov rcx, g_hDlg
+    mov rdx, -2                     ; HWND_NOTOPMOST
+    cmp byte ptr g_ontop, '1'
+    jne ao_set
+    mov rdx, -1                     ; HWND_TOPMOST
+ao_set:
+    xor r8d, r8d
+    xor r9d, r9d
+    and qword ptr [rsp+20h], 0
+    and qword ptr [rsp+28h], 0
+    mov qword ptr [rsp+30h], 13h    ; SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+    call [__imp_SetWindowPos]
+    add rsp, 48h
+    ret
+apply_ontop ENDP
+
 ; Fill the page list
 refresh_nav PROC
     push rbx
@@ -4406,6 +4431,14 @@ di_page:
     call refresh_nav
     call show_page
     call layout_init
+    xor r8d, r8d
+    cmp byte ptr g_ontop, '1'
+    sete r8b
+    mov ecx, IDC_ONTOP
+    mov edx, 0F1h                   ; BM_SETCHECK
+    xor r9d, r9d
+    call send_dlg
+    call apply_ontop
     ; tray icon
     mov dword ptr g_nid, 528
     mov qword ptr g_nid+8, rbx
@@ -4486,6 +4519,8 @@ dp_cmd:
     je dc_twbtn
     cmp eax, IDC_CHATCMD
     je dc_chatcmd
+    cmp eax, IDC_ONTOP
+    je dc_ontop
     jmp dp_true                     ; swallow Enter/Esc (IDOK/IDCANCEL)
 
 dc_ouvert:
@@ -4507,6 +4542,21 @@ dc_ouvertp:
     mov r8d, 128
     call get_text_u8
     jmp dc_unlock
+
+dc_ontop:
+    test r12d, r12d                 ; BN_CLICKED
+    jnz dp_true
+    mov ecx, IDC_ONTOP
+    mov edx, 0F0h                   ; BM_GETCHECK
+    xor r8d, r8d
+    xor r9d, r9d
+    call send_dlg
+    add al, '0'
+    mov byte ptr g_ontop, al
+    mov byte ptr g_ontop+1, 0
+    call apply_ontop
+    call save_settings
+    jmp dp_true
 
 dc_chatcmd:
     cmp r12d, 300h                  ; EN_CHANGE
