@@ -126,6 +126,9 @@ endm
 
 RBUF_SIZE   equ 262144
 TEXTSIZE    equ 4096
+; The song line shown in w_msg (1024): "Song: " + this + the longest result, which is
+; ev_fail1 + a 511-byte scene name + ev_fail2 (537 bytes), + the terminator.
+SONG_LINE_MAX equ 480
 MAXSCENES   equ 256
 NSET        equ 20
 REQ_POLL_MS equ 5000
@@ -988,9 +991,14 @@ sq_r:
     ret
 strip_quotes ENDP
 
-; rcx = dst, rdx = text: copy the text's first line -> rax = dst's terminating zero
+; rcx = dst, rdx = text: copy the text's first line, at most SONG_LINE_MAX bytes
+; -> rax = dst's terminating zero
 first_line PROC
+    mov r8d, SONG_LINE_MAX
 fl_l:
+    test r8d, r8d
+    jz fl_e
+    dec r8d
     mov al, [rdx]
     cmp al, 0Dh
     je fl_e
@@ -1485,6 +1493,8 @@ mg_l:
     jmp mg_next
 mg_num:
     mov rdx, rsi
+    mov r8, [rbx+16]                ; room in this setting, less the terminator
+    dec r8
 mg_nl:
     mov cl, [rax]
     cmp cl, '.'
@@ -1494,6 +1504,9 @@ mg_nl:
     cmp cl, '9'
     ja mg_nend
 mg_nput:
+    test r8, r8
+    jz mg_nend
+    dec r8
     mov [rdx], cl
     inc rdx
     inc rax

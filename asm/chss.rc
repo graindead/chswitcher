@@ -97,8 +97,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,7,1,0
-PRODUCTVERSION  1,7,1,0
+FILEVERSION     1,7,2,0
+PRODUCTVERSION  1,7,2,0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
@@ -107,11 +107,11 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "FileDescription",  "Switches OBS scenes when Clone Hero starts and ends songs"
-            VALUE "FileVersion",      "1.7.1.0"
+            VALUE "FileVersion",      "1.7.2.0"
             VALUE "InternalName",     "chss"
             VALUE "OriginalFilename", "CH Scene Switcher.exe"
             VALUE "ProductName",      "CH Scene Switcher"
-            VALUE "ProductVersion",   "1.7.1.0"
+            VALUE "ProductVersion",   "1.7.2.0"
         END
     END
     BLOCK "VarFileInfo"
